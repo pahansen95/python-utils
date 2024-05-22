@@ -1,6 +1,9 @@
 metadata:
-  name: stable
+  name: stable-all
   version: 0.0.1
+  notes: |
+    Currently this is just the same as the `all` configuration.
+    WebApp Utilities are currently actively under development.
 spec:
   source: src/
   artifact:
