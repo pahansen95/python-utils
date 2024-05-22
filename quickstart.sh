@@ -2,7 +2,7 @@
 
 set -eEuo pipefail
 
-log() { printf -- "%s\n" "$*"; >&2; }
+log() { printf -- "%s\n" "$*" >&2; }
 
 : "${CI_PROJECT_DIR:?Missing CI_PROJECT_DIR}"
 command -v jq >/dev/null || { log "jq is required"; exit 1; }
