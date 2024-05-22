@@ -28,12 +28,12 @@ Configurations define what is built & bundled. See the [build script](./build/__
 
 There are a handful of configurations provided as starting points:
 
-| Path | Description |
-| - | - |
-| [config/stable/](config/stable/) | Configurations scoped to Stable Utilities |
-| [config/stable/all.yaml](./config/stable/all.yaml) | All stable utils |
-| [config/stable/webapp.yaml](./config/stable/minimal.yaml) | A set of stable utils for building WebApps |
-| [config/stable/minimal.yaml](./config/stable/minimal.yaml) | The set of stable utils I most commonly use |
+| Group | Path | Description |
+| - | - | - |
+| [config/stable/](config/stable/) | | Configurations scoped to Stable Utilities |
+| | [config/stable/all.yaml](./config/stable/all.yaml) | All stable utils |
+| | [config/stable/webapp.yaml](./config/stable/minimal.yaml) | A set of stable utils for building WebApps |
+| | [config/stable/minimal.yaml](./config/stable/minimal.yaml) | The set of stable utils I most commonly use |
 
 > NOTES:
 > 
