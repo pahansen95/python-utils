@@ -1,0 +1,6 @@
+.venv
+.cache
+.user.env
+__pycache__/
+.cffibuild/
+*.OLD.py
