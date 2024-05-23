@@ -154,6 +154,8 @@ class _ItemLogCtx:
   """The Async Queue that logs all push events that occur in the Item Log."""
   pop_log: asyncio.Queue = field(default_factory=asyncio.Queue)
   """The Async Queue that logs all pop events that occur in the Item Log."""
+  peekabo: asyncio.Event = field(default_factory=asyncio.Event)
+  """The Async Event that tracks when the Item Log is ready to be peeked at."""
   iter_idx: int = 0
   """The current index of the Item Log when iterating over it."""
   aiter_idx: int = 0
@@ -259,24 +261,19 @@ class ItemLog(Log[I]):
     self.item_removed.clear()
     self._ctx.pop_log = asyncio.Queue()
     self._ctx.push_log = asyncio.Queue()
+    self._ctx.peekabo.clear()
 
   async def peek(self, block: bool = True) -> I | None:
     """Peek at the head of the Log (or None if non-blocking & log is empty); does not remove the Item. Caller does not need to lock the log."""
     logger.trace(f"Log {id(self)} - Peeking at the log")
     if self.empty and not block: return None
     while True:
-      logger.trace(f"Peek Log {id(self)} - Waiting for push log")
-      # A Push Event MUST have occured in order to peek an event.
-      await self._ctx.push_log.get()
-      logger.trace(f"Peek Log {id(self)} - Push log event received")
-      self._ctx.push_log.task_done()
-      logger.trace(f"Peek Log {id(self)} - Acquiring lock")
+      logger.trace(f"Peek Log {id(self)} - Waiting for the push log to populate")
+      await self._ctx.peekabo.wait()
+      logger.trace(f"Peek Log {id(self)} - Peekable")
       async with self.mutex:
-        logger.trace(f"Peek Log {id(self)} - Lock acquired")
-        if self.empty: logger.trace(f"Peek Log {id(self)} - Log is Empty!"); continue # TODO (Should I do this?): There's nothing in the Queue so drop the push event
-        logger.trace(f"Peek Log {id(self)} - Replace Push Event")
-        await self._ctx.push_log.put(None) # We aren't actually consuming an item so make sure to keep the log in-sync
-        logger.trace(f"Peek Log {id(self)} - Returning item")
+        logger.trace(f"Peek Log {id(self)} - Acquiring lock")
+        if self.empty: logger.trace(f"Peek Log {id(self)} - Log is Empty!"); continue
         return self.log[0]
   
   async def pop(self, block: bool = True) -> I:
@@ -294,17 +291,19 @@ class ItemLog(Log[I]):
         logger.trace(f"Pop Log {id(self)} - Lock acquired")
         if self.empty: logger.trace(f"Pop Log {id(self)} - Log is Empty!"); continue # Prevent Race Conditions
         logger.trace(f"Pop Log {id(self)} - Put Pop Event")
+        item = self.log.popleft()
+        if self.empty: self._ctx.peekabo.clear()
         await self._ctx.pop_log.put(None)
         self.item_removed.set()
         logger.trace(f"Pop Log {id(self)} - Returning item")
-        return self.log.popleft()
+        return item
   
   async def push(self, item: I, block: bool = True) -> None | I:
     """Push an Item onto the Log at the tail (or returns the item if non-blocking & log is full). Caller does not need to lock the log."""
     logger.trace(f"Log {id(self)} - Pushing an item on the log")
     if self.full and not block: return item
     while True:
-      if not self.empty: # Don't block if the log is empty; otherwise consume a pop event
+      if not self._ctx.pop_log.empty(): # consume a pop event when available
         logger.trace(f"Push Log {id(self)} - Consuming a pop event")
         await self._ctx.pop_log.get()
         self._ctx.pop_log.task_done()
@@ -313,8 +312,9 @@ class ItemLog(Log[I]):
         logger.trace(f"Push Log {id(self)} - Lock acquired")
         if self.full: logger.trace(f"Push Log {id(self)} - Log is Empty!"); continue # Prevent Race Conditions
         logger.trace(f"Push Log {id(self)} - Put Push Event")
-        await self._ctx.push_log.put(None)
         self.log.append(item)
+        self._ctx.peekabo.set()
+        await self._ctx.push_log.put(None)        
         self.item_added.set()
         logger.trace(f"Push Log {id(self)} - Item pushed")
         return

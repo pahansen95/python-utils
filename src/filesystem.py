@@ -174,7 +174,8 @@ async def delete_file(
   logger.trace(f"Deleting File: {file}")
   try:
     # logger.critical(f"Delete's disabled for development: {file}")
-    file.unlink()
+    # file.unlink()
+    os.unlink(file)
   except Exception as e:
     if return_errors: return e
     raise
@@ -183,7 +184,7 @@ async def write_file(
   file: pathlib.Path,
   content: bytes,
   append: bool = False,
-  mode: int | None = None,
+  mode: int = 0o600,
   owner: tuple[int, int] | None = None,
   io_watcher: IOWatcher = io_watcher,
 ) -> None | Exception:
@@ -199,11 +200,11 @@ async def write_file(
   # Create the file if it doesn't exist
   try:
     fd: int | None = None
-    if not file.exists():
+    if not os.path.exists(file):
       fd = os.open(str(file), FileMode.CREAT | FileMode.EXCL, 0o600)
       os.close(fd)
       fd = None
-    if mode is not None: os.chmod(file, mode)
+    os.chmod(file, mode)
     if owner is not None: os.chown(file, *owner)
     try:
       fd = os.open(str(file), FileMode.WRONLY | (FileMode.APPEND if append else FileMode.TRUNC) | os.O_NONBLOCK)
@@ -242,16 +243,18 @@ async def read_file(
 
 async def create_directory(
   directory: pathlib.Path,
-  mode: int,
-  owner: tuple[int, int],
+  mode: int = 0o600,
+  owner: tuple[int, int] | None = None,
   exist_ok: bool = True,
   return_errors: bool = False,
 ) -> None | Exception:
   """Create a Directory updating the Mode & Owner"""
   logger.trace(f"Creating Directory '{directory}' with Mode '{mode:o}' & Owner '{owner}'")
   try:
-    directory.mkdir(mode=mode, exist_ok=exist_ok)
-    os.chown(directory, *owner)
+    _dir_exists = os.path.exists(directory)
+    if _dir_exists and not exist_ok: raise FileExistsError(f"Directory already exists: {directory}")
+    if not _dir_exists: os.mkdir(directory, mode)
+    if owner is not None: os.chown(directory, *owner)
   except Exception as e:
     if return_errors: return e
     raise
@@ -263,16 +266,17 @@ async def delete_directory(
 ) -> None | Exception:
   """Delete the Directory"""
   logger.trace(f"Deleting Directory: {directory}")
-  if not directory.exists() and not missing_ok:
+  _dir_exists = os.path.exists(directory)
+  if not _dir_exists and not missing_ok:
     raise FileNotFoundError(f"Directory does not exist: {directory}")
-  elif not directory.exists() and missing_ok:
+  elif not _dir_exists and missing_ok:
     return None
-  elif not directory.is_dir():
+  elif not os.path.isdir(directory):
     raise NotADirectoryError(f"Path is not a Directory: {directory}")
   
   try:
     # logger.critical(f"Delete's disabled for development: {directory}")
-    directory.rmdir()
+    os.rmdir(directory)
   except Exception as e:
     if return_errors: return e
     raise
@@ -320,7 +324,7 @@ async def walk_directory_tree(
       elif _true_file.is_file():
         yield _file
       else:
-        logger.warning(f"Skipping unexpected file: {_file}")
+        logger.debug(f"Skipping unexpected file: {_file}")
         continue
 
 async def slurp_directory_tree(
@@ -352,35 +356,36 @@ async def slurp_directory_tree(
       or \
       not file.is_file()
     ):
-      logger.trace(f"Skipping File: {file}")
+      logger.debug(f"Skipping File: {file}")
       continue
-    logger.trace(f"Will load resources from manifest file: {file}")
+    logger.debug(f"Will load resources from manifest file: {file}")
     _load_files.append(file)
 
   assert all(_file.is_file() for _file in _load_files)
-  logger.trace(f"Loading Files: {[str(_f) for _f in _load_files]}")
+  logger.debug(f"Loading Files: {[str(_f) for _f in _load_files]}")
   # Load the Files Concurrently
   _load_files = list(set(_load_files)) # Deduplicate the files
   _load_results: list[bytes | Exception] = await asyncio.gather(*(
     read_file(_file, io_watcher=io_watcher, return_errors=True)
     for _file in _load_files
   ), return_exceptions=True)
-  logger.debug(f"{len(list(filter(lambda x: isinstance(x, Exception), _load_results)))} Errors while loading Files: {list(str(_path) for _path, _result in zip(_load_files, _load_results) if isinstance(_result, Exception))}")
-  logger.trace('\n' + '\n'.join(filter(lambda x: not isinstance(x, Exception), map(lambda x: '########\n' + str(x[0]) + '\n########\n' + x[1].decode("utf-8"), zip(_load_files, _load_results)))))
+  # logger.debug(f"{len(list(filter(lambda x: isinstance(x, Exception), _load_results)))} Errors while loading Files: {list(str(_path) for _path, _result in zip(_load_files, _load_results) if isinstance(_result, Exception))}")
+  # logger.trace('\n' + '\n'.join(filter(lambda x: not isinstance(x, Exception), map(lambda x: '########\n' + str(x[0]) + '\n########\n' + x[1].decode("utf-8"), zip(_load_files, _load_results)))))
 
   return list(zip(_load_files, _load_results))
 
 async def slurp_files(
   files: list[pathlib.Path],
   io_watcher: IOWatcher = io_watcher,
+  return_errors: bool = False,
 ) -> list[tuple[pathlib.Path, bytes | Exception]]:
   """Slurp a list of Files into a list of (Path, Content) tuples."""
   if not io_watcher.running: raise RuntimeError("The IOWatcher must be running to slurp files")
   _load_results: list[bytes | Exception] = await asyncio.gather(*(
     read_file(_file, io_watcher=io_watcher, return_errors=True)
     for _file in files
-  ), return_exceptions=True)
-  logger.debug(f"{len(list(filter(lambda x: isinstance(x, Exception), _load_results)))} Errors while loading Files: {list(str(_path) for _path, _result in zip(files, _load_results) if isinstance(_result, Exception))}")
-  logger.trace('\n' + '\n'.join(filter(lambda x: not isinstance(x, Exception), map(lambda x: '########\n' + str(x[0]) + '\n########\n' + x[1].decode("utf-8"), zip(files, _load_results)))))
+  ), return_exceptions=return_errors)
+  # logger.debug(f"{len(list(filter(lambda x: isinstance(x, Exception), _load_results)))} Errors while loading Files: {list(str(_path) for _path, _result in zip(files, _load_results) if isinstance(_result, Exception))}")
+  # logger.trace('\n' + '\n'.join(filter(lambda x: not isinstance(x, Exception), map(lambda x: '########\n' + str(x[0]) + '\n########\n' + x[1].decode("utf-8"), zip(files, _load_results)))))
 
   return list(zip(files, _load_results))

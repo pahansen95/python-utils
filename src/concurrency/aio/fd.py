@@ -71,7 +71,8 @@ class AsyncFileDescriptor:
       fd_event: IOEvent | None = await self.event_log.peek()
       logger.trace(f"fd{self.fd} - Event: {fd_event.name}")
 
-      if fd_event == IOEvent.READ:
+      # Attempt to read if there is a READ available or the FD is in a CLOSE state; the goal is to drain the kernel buffer before breaking (unless if we read the instructed amount of bytes or the buffer is full)
+      if fd_event == IOEvent.READ or fd_event == IOEvent.CLOSE:
         if _n_is_flag and buffer is None: _n = CHUNK_SIZE # If using an internal Buffer, read the default amount.
         elif _n_is_flag and buffer is not None: _n = len(_buffer) - _buffer_offset - _bytes_read # If using an external Buffer, read up to the remaining space in the buffer
         else: _n = n - _bytes_read # Otherwise Read the remaining bytes instructed irrespective of buffer sizes
@@ -89,7 +90,6 @@ class AsyncFileDescriptor:
       if (
         (err == IOErrorReason.NONE and _read <= 0)
         or err == IOErrorReason.BLOCK
-        or err == IOErrorReason.EOF
         or err == IOErrorReason.EOF
       ): await self.event_log.pop()
 

@@ -195,6 +195,7 @@ class IOWatcher:
       while True:
         # logger.trace("Polling for IO Events")
         if count > 0: # If we polled more than once w/out any new events then backoff
+          logger.trace(f"Backoff: {count}")
           # if count == 0: datum = time.monotonic_ns()
           _duration = self.backoff.remaining_wait_time(_now(), count)
           # logger.trace(f"Waiting for {_duration}ns")

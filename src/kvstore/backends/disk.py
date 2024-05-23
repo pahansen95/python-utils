@@ -7,6 +7,12 @@ import asyncio
 import enum
 import orjson
 from loguru import logger
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes, serialization, padding
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from os import urandom
 
 from .. import KVStore, Key, Value, EmptyValue, PathKey, EMPTY, EMPTY_META
 import utils.concurrency.aio.watch as aiow
@@ -53,6 +59,8 @@ class FileLock:
 @dataclass
 class _StoreCtx:
   """The Stateful Context of the Disk Store"""
+
+  _: KW_ONLY
 
   online: asyncio.Event = field(default_factory=asyncio.Event)
   """Is the KV Store Online"""
@@ -139,6 +147,19 @@ class DiskStore(KVStore):
       "meta": await fs.open_file(_meta, fs.FileMode.RDRW | fs.FileMode.APPEND, io_watcher=self._ctx.io_watcher),
       "val": await fs.open_file(_val, fs.FileMode.RDRW | fs.FileMode.APPEND, io_watcher=self._ctx.io_watcher),
     }
+    logger.trace('\n'.join((
+      f"Key {key}...",
+      f"  Metadata File Opened",
+      f"    Read FD: {self._ctx.open_keys[key]['meta'][0].fd}",
+      f"    Read Log: {id(self._ctx.open_keys[key]['meta'][0].event_log)}",
+      f"    Write FD: {self._ctx.open_keys[key]['meta'][1].fd}",
+      f"    Write Log: {id(self._ctx.open_keys[key]['meta'][1].event_log)}",
+      f"  Value File Opened",
+      f"    Read FD: {self._ctx.open_keys[key]['val'][0].fd}",
+      f"    Read Log: {id(self._ctx.open_keys[key]['val'][0].event_log)}",
+      f"    Write FD: {self._ctx.open_keys[key]['val'][1].fd}",
+      f"    Write Log: {id(self._ctx.open_keys[key]['val'][1].event_log)}",
+    )))
     assert isinstance(self._ctx.open_keys[key], dict), self._ctx.open_keys[key]
     assert isinstance(self._ctx.open_keys[key]["meta"], tuple), self._ctx.open_keys[key]["meta"]
     assert isinstance(self._ctx.open_keys[key]["meta"][0], fs.AsyncFileDescriptor), self._ctx.open_keys[key]["meta"][0]
@@ -161,8 +182,11 @@ class DiskStore(KVStore):
     _dir = self._key_to_disk_path(key)
     if not _dir.exists(): return
     await asyncio.gather(*(
-      fs.delete_file(_dir / "val.bin"),
-      fs.delete_file(_dir / "meta.json"),
+      fs.delete_file(f)
+      for f in [
+        _dir / "val.bin",
+        _dir / "meta.json"
+      ] if f.exists()
     ))
     logger.trace(f"{[f for f in _dir.iterdir()]=}")
     await fs.delete_directory(_dir)
@@ -170,10 +194,21 @@ class DiskStore(KVStore):
   async def _read_key(self, key: str) -> tuple[_metadata_t, bytes]:
     """Read the Metadata & Value of a Key"""
     assert key in self._ctx.open_keys
+    # _pos = tuple(await asyncio.gather(*(
+    #   fs.tell(self._ctx.open_keys[key]["meta"][0]),
+    #   fs.tell(self._ctx.open_keys[key]["val"][0]),
+    # )))
+    # logger.trace(f'{_pos=}')
     await asyncio.gather(*( # Reset the File Pointers First
       fs.seek(self._ctx.open_keys[key]["meta"][0], 0),
       fs.seek(self._ctx.open_keys[key]["val"][0], 0),
     ))
+    # logger.trace(f'{self._ctx.open_keys[key]["meta"][0].event_log.log=}')
+    # logger.trace(f'{self._ctx.open_keys[key]["val"][0].event_log.log=}')
+    # assert (await asyncio.gather(*(
+    #   fs.tell(self._ctx.open_keys[key]["meta"][0]),
+    #   fs.tell(self._ctx.open_keys[key]["val"][0]),
+    # ))) == [0, 0]
     _data = tuple(await asyncio.gather(*(
       self._ctx.open_keys[key]["meta"][0].read(fs.IOCondition.EOF),
       self._ctx.open_keys[key]["val"][0].read(fs.IOCondition.EOF)
@@ -261,17 +296,17 @@ class DiskStore(KVStore):
   def is_registered(self, kind: type[Value]) -> bool:
     """Is a Value Type registered with the Store"""
     if not self._ctx.online.is_set(): raise RuntimeError("KVStore is offline")
-    return str(kind) in self._ctx.factory
+    return kind.__name__ in self._ctx.factory
   
   def register_value(self, kind: type[Value], factory: Callable[[ByteString], Value]) -> None:
     """Register a Value Type with the Store"""
     if not self._ctx.online.is_set(): raise RuntimeError("KVStore is offline")
-    self._ctx.factory[str(kind)] = factory
+    self._ctx.factory[kind.__name__] = factory
   
   def deregister_value(self, kind: type[Value]) -> None:
     """Deregister a Value Type with the Store"""
     if not self._ctx.online.is_set(): raise RuntimeError("KVStore is offline")
-    del self._ctx.factory[str(kind)]
+    del self._ctx.factory[kind.__name__]
 
   async def exists(self, key: PathKey) -> bool:
     """Does the Key exist in the Store"""
@@ -303,7 +338,7 @@ class DiskStore(KVStore):
   async def set(self, key: PathKey, value: Value) -> None:
     """Set a Value in the Store"""
     if not self._ctx.online.is_set(): raise RuntimeError("KVStore is offline")
-    _kind = str(type(value))
+    _kind = value.__class__.__name__
     if _kind not in self._ctx.factory: raise ValueError(f"Value Kind `{_kind}` is not registered with the Store")
     _key = key()
     lock = await self._get_key_lock(_key, LockMode.READ)
@@ -337,9 +372,10 @@ class DiskStore(KVStore):
       if key not in self._ctx.open_keys: await self._open_key(_key)
       _meta, _val = await self._read_key(_key)
       if _val == b"": _pop_val = default
-      _kind = _meta["kind"]
-      if _kind not in self._ctx.factory: raise ValueError(f"Value Kind `{_kind}` is not registered with the Store")
-      _pop_val = self._ctx.factory[_kind](_val)
+      else:
+        _kind = _meta["kind"]
+        if _kind not in self._ctx.factory: raise ValueError(f"Value Kind `{_kind}` is not registered with the Store")
+        _pop_val = self._ctx.factory[_kind](_val)
 
     try:
       # Close all the keys
@@ -372,3 +408,131 @@ class DiskStore(KVStore):
     """Delete a Value (& it's children) from the Store and return just the key's value (not any of the children)"""
     if not self._ctx.online.is_set(): raise RuntimeError("KVStore is offline")
     return await self._delete(key, True, default)
+
+@dataclass
+class _VaultCtx(_StoreCtx):
+  """The Stateful Context of the Vault"""
+
+  _: KW_ONLY
+
+  unsealed: asyncio.Event = field(default_factory=asyncio.Event)
+  """Is the Vault Unsealed"""
+  crypt_backend: Any | None = None
+  secret: bytes | None = None
+
+@dataclass
+class DiskVault(DiskStore):
+  """A Disk Based Hierarchical Key Value Store where values are encrypted on disk."""
+
+  secret_file: Path
+  """The Symmetric Key used to encrypt the disk values"""
+  privkey_file: Path
+  """The Assymetric Private Key used to decrypt the secret"""
+  pubkey_file: Path
+  """The Assymetric Public Key used to encrypt the secret"""
+
+  _: KW_ONLY
+  _ctx: _VaultCtx = field(default_factory=_VaultCtx)
+
+  @classmethod
+  def override_ctx(cls, *args: Any, **kwargs: Any) -> DiskVault:
+    """Override the Context of the Vault"""
+    if "_ctx" in kwargs: raise ValueError("Cannot override the Context of a Vault directly; please specify the Context Parameters directly")
+    cls_kwargs = {f.name: kwargs.pop(f.name) for f in fields(cls) if f.name in kwargs}
+    return cls(
+      *args,
+      **(cls_kwargs | {"_ctx": _VaultCtx(**kwargs)})
+    )
+
+  async def connect(self):
+    """Open a session w/ the Vault"""
+    await self._unseal()
+    await super().connect()
+  
+  async def disconnect(self):
+    """Close the Vault Session & cleanup resources"""
+    await super().disconnect()
+    await self._seal()
+
+  async def _seal(self):
+    """Seal the Vault"""
+    self._ctx.crypt_backend = None
+    self._ctx.secret = None
+    self._ctx.unsealed.clear()
+
+  async def _unseal(self):
+    """Unseal the Vault"""
+    (
+      secret_bytes,
+      privkey_bytes,
+      pubkey_bytes,
+    ) = await asyncio.gather(*(
+      fs.read_file(self.secret_file, io_watcher=self._ctx.io_watcher),
+      fs.read_file(self.privkey_file, io_watcher=self._ctx.io_watcher),
+      fs.read_file(self.pubkey_file, io_watcher=self._ctx.io_watcher),
+    ))
+
+    ### Load the Secret ###
+    self._ctx.crypt_backend = default_backend()
+    privkey = serialization.load_pem_private_key(privkey_bytes, password=None, backend=self._ctx.crypt_backend)
+    pubkey = serialization.load_pem_public_key(pubkey_bytes, backend=self._ctx.crypt_backend)
+    if pubkey != privkey.public_key(): raise ValueError("Public Key does not match Private Key")
+    self._ctx.secret = privkey.decrypt(secret_bytes, asym_padding.OAEP(mgf=asym_padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+    self._ctx.unsealed.set()
+
+  def _encrypt(self, buf: bytes) -> bytes:
+    """Encrypt a Buffer"""
+    assert self._ctx.unsealed.is_set(), "Can't encrypt while the Vault is sealed"
+
+    enc_buf = bytearray(b'Salted__' + urandom(32))
+    ### NOTE: The Encrypted File Format is as follows...
+    assert enc_buf[:8] == b'Salted__' # We use OpenSSL's Magic Header
+    salt = bytes(enc_buf[8:24]) # 16 bytes long salt
+    iv = bytes(enc_buf[24:40]) # 16 bytes long IV
+    ### See `man openssl-enc` for more information
+    padder = padding.PKCS7(128).padder() # 128-bit block size for AES
+    key = PBKDF2HMAC(
+      algorithm=hashes.SHA256(),
+      length=256 // 8,
+      salt=salt,
+      iterations=100000,
+      backend=self._ctx.crypt_backend,
+    ).derive(self._ctx.secret)
+    encryptor = Cipher(
+      algorithm=algorithms.AES(key),
+      mode=modes.CBC(iv),
+      backend=self._ctx.crypt_backend,
+    ).encryptor()
+    enc_buf.extend(encryptor.update(padder.update(buf) + padder.finalize()) + encryptor.finalize())
+    return bytes(enc_buf)
+
+  def _decrypt(self, buf: bytes) -> bytes:
+    """Decrypt a Buffer"""
+    assert self._ctx.unsealed.is_set(), "Can't decrypt while the Vault is sealed"
+    ### NOTE: The Encrypted File Format is as follows...
+    assert buf[:8] == b'Salted__' # We use OpenSSL's Magic Header
+    salt = buf[8:24] # 16 bytes long salt
+    iv = buf[24:40] # 16 bytes long IV
+    data = buf[40:]
+    ### See `man openssl-enc` for more information
+    unpadder = padding.PKCS7(128).unpadder() # 128-bit block size for AES
+    key = PBKDF2HMAC(
+      algorithm=hashes.SHA256(),
+      length=256 // 8,
+      salt=salt,
+      iterations=100000,
+      backend=self._ctx.crypt_backend,
+    ).derive(self._ctx.secret)
+    decryptor = Cipher(
+      algorithm=algorithms.AES(key),
+      mode=modes.CBC(iv),
+      backend=self._ctx.crypt_backend,
+    ).decryptor()
+    return unpadder.update(decryptor.update(data) + decryptor.finalize()) + unpadder.finalize()
+  
+  async def _read_key(self, key: str) -> tuple[_metadata_t, bytes]:
+    metadata, enc_buf = await super()._read_key(key)
+    return ( metadata, self._decrypt(enc_buf) if enc_buf else enc_buf ) # Passthrough empty values
+  
+  async def _write_key(self, key: str, metadata: _metadata_t, value: ByteString):
+    return await super()._write_key(key, metadata, self._encrypt(value))
