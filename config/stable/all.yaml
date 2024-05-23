@@ -31,6 +31,11 @@ spec:
             kind: pythonModule
             src: metrics.py
             dst: metrics.py
+        testing:
+          module:
+            kind: pythonModule
+            src: testing.py
+            dst: testing.py
       pkgs:
         concurrency:
           requirements: concurrency/requirements.txt # Path relative to the SubPackage
