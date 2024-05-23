@@ -1,9 +1,6 @@
 metadata:
-  name: stable-all
+  name: stable-no-web
   version: 0.0.1
-  notes: |
-    Currently this is just the same as the `all` configuration.
-    WebApp Utilities are currently actively under development.
 spec:
   source: src/
   artifact:
@@ -34,6 +31,11 @@ spec:
             kind: pythonModule
             src: metrics.py
             dst: metrics.py
+        testing:
+          module:
+            kind: pythonModule
+            src: testing.py
+            dst: testing.py
       pkgs:
         concurrency:
           requirements: concurrency/requirements.txt # Path relative to the SubPackage
@@ -82,15 +84,3 @@ spec:
                     kind: pythonModule
                     src: kvstore/backends/disk.py
                     dst: kvstore/backends/disk.py
-        web:
-          requirements: web/requirements.txt # Path relative to the SubPackage
-          init:
-            kind: pythonInit
-            src: web/__init__.py
-            dst: web/__init__.py
-          modules:
-            app:
-              module:
-                kind: pythonModule
-                src: web/app.py
-                dst: web/app.py
