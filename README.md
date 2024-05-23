@@ -34,6 +34,8 @@ There are a handful of configurations provided as starting points:
 | | [config/stable/all.yaml](./config/stable/all.yaml) | All stable utils |
 | | [config/stable/webapp.yaml](./config/stable/minimal.yaml) | A set of stable utils for building WebApps |
 | | [config/stable/minimal.yaml](./config/stable/minimal.yaml) | The set of stable utils I most commonly use |
+| edge |  |  |
+|  | [config/edge/all.yaml](./config/edge/all.yaml) | All utils, working or otherwise |
 
 > NOTES:
 > 
