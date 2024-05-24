@@ -138,6 +138,17 @@ test_utils() {
 
 ### Main Logic ###
 
+declare -A kwargs=(
+  [config]="${CONFIG_DIR}/stable/all.yaml"
+)
+for argv in "$@"; do
+  case "${argv}" in
+    config=* ) kwargs[config]="${argv#*=}" ;;
+    * ) log "Unknown argument: ${argv}" ;;
+  esac
+done
+[[ -f "${kwargs[config]}" ]] || { log "Missing Config File: ${kwargs[config]}"; exit 1; }
+
 declare CLEANUP; CLEANUP="${CLEANUP:-true}"
 _on_err() {
   declare -g CLEANUP=false
@@ -164,7 +175,7 @@ declare outputs_dir="${workdir}/build-outputs"
 install -dm0755 "${outputs_dir}"
 
 ### Build the Utils Library ###
-build_utils workdir="${workdir}" cfg="${CONFIG_DIR}/stable/all.yaml"
+build_utils workdir="${workdir}" cfg="${kwargs[config]}"
 
 ### Replace the Source Directory ###
 unlink "${src_dir}"
