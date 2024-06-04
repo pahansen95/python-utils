@@ -123,10 +123,12 @@ async def open_file(
       return (
         AsyncFileDescriptor(
           rfd,
+          'file',
           io_watcher.register(rfd, _watch & ~IOEvent.WRITE, watch_backend=WatchBackend.POLL),
         ) if _read else None,
         AsyncFileDescriptor(
           wfd,
+          'file',
           io_watcher.register(wfd, _watch & ~IOEvent.READ, watch_backend=WatchBackend.POLL),
         ) if _write else None,
       )
@@ -134,6 +136,7 @@ async def open_file(
       fd = os.open(str(file), FileMode.CREAT | _extra_mode)
       return AsyncFileDescriptor(
         fd,
+        'file',
         io_watcher.register(fd, _watch, watch_backend=WatchBackend.POLL),
       )
     # Catch Bugs
@@ -208,7 +211,7 @@ async def write_file(
     if owner is not None: os.chown(file, *owner)
     try:
       fd = os.open(str(file), FileMode.WRONLY | (FileMode.APPEND if append else FileMode.TRUNC) | os.O_NONBLOCK)
-      afd = AsyncFileDescriptor(fd, io_watcher.register(fd, IOEvent.WRITE, watch_backend=WatchBackend.POLL))
+      afd = AsyncFileDescriptor(fd, 'file', io_watcher.register(fd, IOEvent.WRITE, watch_backend=WatchBackend.POLL))
       bytes_written = 0
       while bytes_written < len(content):
         bytes_written += await afd.write(content, len(content) - bytes_written, bytes_written)
@@ -231,7 +234,7 @@ async def read_file(
     fd: int | None = None
     try:
       fd = os.open(str(file), FileMode.RDONLY | os.O_NONBLOCK)
-      afd = AsyncFileDescriptor(fd, io_watcher.register(fd, IOEvent.READ, watch_backend=WatchBackend.POLL))
+      afd = AsyncFileDescriptor(fd, 'file', io_watcher.register(fd, IOEvent.READ, watch_backend=WatchBackend.POLL))
       file_contents: bytes = await afd.read(IOCondition.EOF)
       return file_contents
     finally:
