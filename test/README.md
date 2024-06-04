@@ -28,22 +28,20 @@ python3 -m test run group-name-1 group-name-2
 First you need to make your source code importable. Generally you can either:
 
 - Install a built package you already prepared
-- Setup a directory structure for Python to search for the source code
+- Add your src dir to the `PYTHONPATH` environment variable.
 
-Below we demonstrate making the source code for the `utils` package importable by setting up a directory structure.
+Below we demonstrate the later.
 
 ```shell
 
 # This assumes the current project is the `python-utils` project
 install -dm0755 "${CI_PROJECT_DIR}/.cache/.pythonpath"
-ln -s "${CI_PROJECT_DIR}/src" "${CI_PROJECT_DIR}/.cache/.pythonpath/utils"
+ln -s "${CI_PROJECT_DIR}/src/foo" "${CI_PROJECT_DIR}/.cache/.pythonpath/"
 export PYTHONPATH="${CI_PROJECT_DIR}/.cache/.pythonpath:${PYTHONPATH}"
 
 ```
 
 Then you can write tests using the following template:
-
-> Assumes there exists a Python module/package `foo` under `src/`
 
 ```python
 
