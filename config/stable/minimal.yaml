@@ -28,6 +28,12 @@ spec:
             kind: pythonInit
             src: concurrency/__init__.py
             dst: concurrency/__init__.py
+          modules:
+            log:
+              module:
+                kind: pythonModule
+                src: concurrency/log.py
+                dst: concurrency/log.py
           pkgs:
             aio:
               init:
