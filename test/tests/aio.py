@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, os, tempfile, random, string
+import asyncio, os, tempfile, random, string, socket
 from typing import ContextManager, Literal, Generator, ByteString, Coroutine
 from contextlib import contextmanager
 from loguru import logger
@@ -7,58 +7,60 @@ from utils.testing import TestResult, TestCode
 
 ### Test Exports
 __all__ = [
-  "test_fd_read_file",
-  "test_fd_read_stream",
+  "test_fd_read_file", "test_fd_read_stream",
+  "test_fd_write_file", "test_fd_write_stream",
+  "test_AsyncFileDescriptor_read_file", "test_AsyncFileDescriptor_read_stream",
+  "test_AsyncFileDescriptor_write_file", "test_AsyncFileDescriptor_write_stream",
 ]
 ###
 
-fd_kinds_t = Literal['file', 'pty', 'pipe']
+fd_kinds_t = Literal['file', 'unix', 'pipe']
 
-def _fd_context_factory(kind: fd_kinds_t,) -> ContextManager[tuple[int, int]]:
-  
-  # TODO: Implement Unix Domain, TCP & UDP Sockets
+@contextmanager
+def _unix_socket_factory() -> Generator[tuple[int, int], None, None]:
+  """Creates a Unix Socket returning a tuple of (read_fd, write_fd)"""
+  server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+  client_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+  socket_path = tempfile.mktemp()
+  try:
+    server_socket.bind(socket_path)
+    server_socket.listen(1)
+    client_socket.connect(socket_path)
+    conn, _ = server_socket.accept()
+    rfd, wfd = conn.fileno(), client_socket.fileno()
+    os.set_blocking(rfd, False); os.set_blocking(wfd, False)
+    yield (rfd, wfd)
+  finally:
+    server_socket.close()
+    client_socket.close()
+    if os.path.exists(socket_path):
+      os.remove(socket_path)
 
-  if kind == 'file': _factory = lambda: tempfile.mkstemp()[0]
-  elif kind == 'pty': _factory = lambda: os.openpty()
-  elif kind == 'pipe': _factory = lambda: os.pipe()
+@contextmanager
+def _file_fd_factory() -> Generator[tuple[int, int], None, None]:
+  """Creates a temporary file returning a tuple of (read_fd, write_fd)"""
+  fd = tempfile.mkstemp()[0]
+  try:
+    os.set_blocking(fd, False)
+    yield (fd, fd)
+  finally:
+    os.close(fd)
+
+@contextmanager
+def _pipe_fd_factory() -> Generator[tuple[int, int], None, None]:
+  """Creates a pipe returning a tuple of (read_fd, write_fd)"""
+  rfd, wfd = os.pipe()
+  try:
+    os.set_blocking(rfd, False); os.set_blocking(wfd, False)
+    yield (rfd, wfd)
+  finally:
+    os.close(rfd); os.close(wfd)
+
+def _fd_context_factory(kind: fd_kinds_t) -> ContextManager[tuple[int, int]]:
+  if kind == 'file': return _file_fd_factory()
+  elif kind == 'unix': return _unix_socket_factory()
+  elif kind == 'pipe': return _pipe_fd_factory()
   else: raise ValueError(f"Invalid kind: '{kind}'")
-
-  @contextmanager
-  def _fd_factory(kind: Literal['file', 'pty', 'pipe']) -> Generator[tuple[int, int], None, None]:
-    """Returns a File Descriptor for reading and writing"""
-    _cleanup = lambda: None
-    try:
-      if kind == 'file':
-        fd = _factory()
-        os.set_blocking(fd, False)
-        def _cleanup() -> None:
-          os.close(fd)
-        yield (fd, fd)
-      elif kind == 'pty':
-        rfd, wfd = _factory()
-        os.set_blocking(rfd, False)
-        os.set_blocking(wfd, False)
-        def _cleanup() -> None:
-          os.close(rfd)
-          os.close(wfd)
-        yield (rfd, wfd)
-      elif kind == 'pipe':
-        rfd, wfd = _factory()
-        os.set_blocking(rfd, False)
-        os.set_blocking(wfd, False)
-        def _cleanup() -> None:
-          os.close(rfd)
-          os.close(wfd)
-        yield (rfd, wfd)
-      else: raise NotImplementedError(kind)
-    except:
-      logger.opt(exception=True).error("Error")
-      raise
-    finally:
-      logger.info(f"Cleaning up {kind} file descriptor")
-      _cleanup()
-
-  return _fd_factory(kind.lower())
 
 def _fd_duplicate(fd: int) -> int:
   dup = os.dup(fd)
@@ -143,7 +145,7 @@ async def _set_fd_state_for_reading(
         else: raise RuntimeError(f"Unexpected OSError encounted when writing to nonblocking {kind}: No. {err.errno}: {err.strerror}")
 
     os.lseek(rfd, 0, os.SEEK_SET)
-  elif kind in ('pty', 'pipe'):
+  elif kind in ('unix', 'pipe'):
     async def _drain_stream(rfd: int, write_task: asyncio.Task):
       try:
         logger.debug(f"Draining fd:{rfd}")
@@ -151,19 +153,16 @@ async def _set_fd_state_for_reading(
           logger.debug(f"Waiting for Write Task to fd:{wfd} to cancel")
           write_task.cancel()
           try: await write_task
-          except asyncio.CancelledError: pass
+          except: pass
         while True:
           try:
             chunk = os.read(rfd, 16384)
-            logger.trace(f"Drained Chunk of size {len(chunk)} from fd:{rfd}")
           except OSError as err:
-            logger.trace(f"fd:{rfd} encountered OS Error No. {err.errno}: {err.strerror}")
             if err.errno == 11: break # No more to read
             else: raise RuntimeError(f"Unexpected OSError encounted when writing to nonblocking {kind}: No. {err.errno}: {err.strerror}")  
       except:
         logger.opt(exception=True).debug("Error Encountered Draining Stream")
         raise
-      finally: logger.trace(f"Exit _drain_stream for fd:{rfd}")
     async def _write_content_to_stream(wfd: int, content: ByteString, content_size: int):
       try:
         total_bytes_written = 0
@@ -172,15 +171,12 @@ async def _set_fd_state_for_reading(
             total_bytes_written += os.write(wfd, content[total_bytes_written:content_size])
             logger.debug(f"{(100 * total_bytes_written / content_size):.1f}% written to fd:{wfd}")
           except OSError as err:
-            logger.trace(f"fd:{wfd} encountered OS Error No. {err.errno}: {err.strerror}")
             if err.errno == 11: # Non Blocking Error
               await asyncio.sleep(0) # yield to event loop so we don't block the thread
               continue
             else: raise RuntimeError(f"Unexpected OSError encounted when writing to nonblocking {kind}: No. {err.errno}: {err.strerror}")
-      except:
-        logger.opt(exception=True).debug("Error Encountered Writing Content to Stream")
-        raise
-      finally: logger.trace(f"Exit _write_content_to_stream for fd:{wfd}")
+      except asyncio.CancelledError: return
+      except: logger.opt(exception=True).debug("Error Encountered Writing Content to Stream")
     return _drain_stream(rfd, asyncio.create_task(_write_content_to_stream(wfd, content, content_size)))
   else: raise NotImplementedError(kind)
 
@@ -190,6 +186,7 @@ async def _set_fd_state_for_writing(
   content: ByteString, content_size: int
 ) -> tuple[Coroutine, Coroutine | None]:
   """Sets up a FD to be written to; return as tuple of Coroutines where the first returns the content written to the fd & the optional second cleans up any resources"""
+  assert not os.get_blocking(rfd) and not os.get_blocking(wfd)
   if kind in ('file',):
     async def _dump_file(rfd: int) -> bytes:
       try:
@@ -198,18 +195,15 @@ async def _set_fd_state_for_writing(
         while True:
           try:
             chunk = os.read(rfd, 16384)
-            logger.trace(f"Read a chunk of size {len(chunk)} bytes from fd{rfd}")
             if chunk == b'': break
             buffer.extend(chunk)
           except OSError as err:
             if err.errno == 11: await asyncio.sleep(0)
             else: raise RuntimeError(f"Unexpected OSError encounted when writing to nonblocking {kind}: No. {err.errno}: {err.strerror}")  
-        logger.trace(f"Read a total of {len(buffer)} bytes from fd{rfd}")
         return bytes(buffer)
       except:
         logger.opt(exception=True).debug(f"Error Encountered while Dumping fd{rfd} Contents")
         raise
-      finally: logger.trace(f"Exit _set_fd_state_for_writing for fd:{wfd}")
     async def _reset_file(rfd: int, wfd: int) -> bytes:
       try:
         os.lseek(wfd, 0, os.SEEK_SET)
@@ -218,9 +212,8 @@ async def _set_fd_state_for_writing(
       except:
         logger.opt(exception=True).debug(f"Error Encountered while Reseting fd{wfd} Contents")
         raise
-      finally: logger.trace(f"Exit _set_fd_state_for_writing for fd:{wfd}")
     return (_dump_file(rfd), _reset_file(rfd, wfd))
-  elif kind in ('pty', 'pipe'):
+  elif kind in ('unix', 'pipe'):
     buffer = bytearray()
     async def _read_fd(rfd: int, buffer: bytearray):
       try:
@@ -229,15 +222,18 @@ async def _set_fd_state_for_writing(
             chunk = os.read(rfd, 16384)
             buffer.extend(chunk)
           except OSError as err:
-            if err.errno == 11: await asyncio.sleep(0) # NonBlock
-            else: raise err
-      except asyncio.CancelledError: pass
+            if err.errno == 11: await asyncio.sleep(0) # Blocking Error
+            else:
+              logger.opt(exception=err).warning(f"Error Reading FD: {err.errno}: {err.strerror}")
+              return
+      except asyncio.CancelledError: return
       except: logger.opt(exception=True).critical(f"Unhandled Error encounterd while reading from fd:{rfd}")
+
     async def _dump_fd(read_task: asyncio.Task, buffer: bytearray) -> bytes:
       if not read_task.done():
-        logger.trace(f"Awaiting ReadTask for fd:{rfd}")
         await read_task
       return bytes(buffer)
+
     async def _reset_fd(read_task: asyncio.Task, rfd: int) -> bytes:
       if not read_task.done():
         read_task.cancel()
@@ -250,8 +246,9 @@ async def _set_fd_state_for_writing(
           except OSError as err:
             if err.errno == 11: break
             else: raise
-      except asyncio.CancelledError: pass
+      except asyncio.CancelledError: return
       except: logger.opt(exception=True).critical(f"Unhandled Error encounterd while reading from fd:{rfd}")
+    
     read_task = asyncio.create_task(_read_fd(rfd, buffer))
     return (_dump_fd(read_task, buffer), _reset_fd(read_task, rfd))
   else: raise NotImplementedError
@@ -276,7 +273,6 @@ async def test_fd_read_file(*args, **kwargs) -> TestResult:
   from utils.concurrency.aio.linux import (
     fd_read,
   )
-  import os
 
   small_content, big_content = generate_rand_content(32, 1024*128)
   buffer = bytearray()
@@ -401,7 +397,6 @@ async def test_fd_read_stream(*args, **kwargs) -> TestResult:
   from utils.concurrency.aio.linux import (
     fd_read,
   )
-  import os
 
   small_content, big_content = generate_rand_content(32, 1024*128)
   buffer = bytearray()
@@ -409,7 +404,6 @@ async def test_fd_read_stream(*args, **kwargs) -> TestResult:
     buffer.clear()
     buffer.extend(b'\x00' * size)
     assert len(buffer) == size
-    logger.trace(f"Reset Buffer {id(buffer)} to size {len(buffer)}")
 
   stream_cleanup: Coroutine | None
   for (
@@ -418,7 +412,7 @@ async def test_fd_read_stream(*args, **kwargs) -> TestResult:
     content,
     content_size,
   ) in _fd_combinations(
-    ['pty', 'pipe'],
+    ['unix', 'pipe'],
     [small_content, big_content]
   ):
     try:
@@ -439,10 +433,10 @@ async def test_fd_read_stream(*args, **kwargs) -> TestResult:
         elif not err in (IOErrorReason.BLOCK, err == IOErrorReason.INTERRUPT): assert False, f'Encountered an unexpected IOErrorReason while reading from `{kind}` File Descriptor: {err.name}'
         else: await asyncio.sleep(0) # We need to explicitly yield to the event loop so we don't block the thread
       err, _ = fd_read(rfd, content_size)
+      await stream_cleanup; stream_cleanup = None
       assert err == IOErrorReason.BLOCK, f"When reading a stream after first exhausting it, the expected IOErrorReason is {IOErrorReason.BLOCK.name}; we got {err.name}"
       assert len(buffer) == len(content), f"content size mismatch: got {len(buffer)}; expected {len(content)}"
       assert buffer[:] == content[:], f"content mismatch: got {bytes(buffer)}; expected {bytes(content)}"
-      await stream_cleanup; stream_cleanup = None
       logger.info("Test 1 -  Successful Completion")
 
       """NOTE Test 2 - Read `n` bytes from File into Buffer
@@ -463,10 +457,10 @@ async def test_fd_read_stream(*args, **kwargs) -> TestResult:
         elif not err in (IOErrorReason.BLOCK, err == IOErrorReason.INTERRUPT): assert False, f'Encountered an unexpected IOErrorReason while reading from `{kind}` File Descriptor: {err.name}'
         else: await asyncio.sleep(0) # We need to explicitly yield to the event loop so we don't block the thread
       err, _ = fd_read(rfd, content_size)
+      await stream_cleanup; stream_cleanup = None
       assert err == IOErrorReason.BLOCK, f"When reading a stream after first exhausting it, the expected IOErrorReason is {IOErrorReason.BLOCK.name}; we got {err.name}"
       assert len(buffer) == len(content), f"content size mismatch: got {len(buffer)}; expected {len(content)}"
       assert buffer[:] == content[:], f"content mismatch: got {bytes(buffer)}; expected {bytes(content)}"
-      await stream_cleanup; stream_cleanup = None
       logger.info("Test 2 -  Successful Completion")
     except AssertionError as ae: return TestResult(TestCode.FAIL, msg=str(ae))
     finally:
@@ -477,7 +471,7 @@ async def test_fd_read_stream(*args, **kwargs) -> TestResult:
     (rfd, wfd),
     _, _
   ) in _fd_combinations(
-    ['pty', 'pipe'],
+    ['unix', 'pipe'],
     [b''],
   ):
     try:
@@ -508,9 +502,9 @@ async def test_fd_read_stream(*args, **kwargs) -> TestResult:
       fd = _fd_duplicate(rfd)
       os.close(fd)
       err, _empty_bytes = fd_read(fd, 16384)
+      await stream_cleanup; stream_cleanup = None
       assert err == IOErrorReason.CLOSED, f"Reading from a closed FileDescriptor should exclusively result in a IOErrorReason of `{IOErrorReason.CLOSED.name}`: got {err.name}"
       assert _empty_bytes[:] == b'', f"Reading from a closed FileDescriptor should exclusively result in an empty byte string: got `{_empty_bytes}`"
-      await stream_cleanup; stream_cleanup = None
       logger.info("Test 3 -  Successful Completion")
     except AssertionError as ae: return TestResult(TestCode.FAIL, msg=str(ae))
     finally:
@@ -536,7 +530,6 @@ async def test_fd_write_file(*args, **kwargs) -> TestResult:
   from utils.concurrency.aio.linux import (
     fd_write,
   )
-  import os
 
   reset_fd = None
   small_content, big_content = generate_rand_content(32, 1024*128)
@@ -654,7 +647,6 @@ async def test_fd_write_stream(*args, **kwargs) -> TestResult:
   from utils.concurrency.aio.linux import (
     fd_write,
   )
-  import os
 
   reset_fd = None
   small_content, big_content = generate_rand_content(32, 1024*128)
@@ -669,7 +661,7 @@ async def test_fd_write_stream(*args, **kwargs) -> TestResult:
     content,
     content_size,
   ) in _fd_combinations(
-    ['pty', 'pipe'],
+    ['unix', 'pipe'],
     [small_content, big_content]
   ):
     try:
@@ -752,4 +744,298 @@ async def test_fd_write_stream(*args, **kwargs) -> TestResult:
     except AssertionError as ae: return TestResult(TestCode.FAIL, msg=str(ae))
     finally:
       if reset_fd is not None: await reset_fd; reset_fd = None
+  return TestResult(TestCode.PASS)
+
+async def test_AsyncFileDescriptor_read_file(*args, **kwargs) -> TestResult:
+  """Test Reading from an AsyncFile Descriptor backed by a file.
+
+  """
+  from utils.concurrency.aio import (
+    AIOError,
+    IOErrorReason, IOEvent, IOCondition,
+    ItemLog,
+  )
+  from utils.concurrency.aio.fd import AsyncFileDescriptor
+  from utils.concurrency.aio.watch import (
+    IOWatcher, WatchBackend,
+  )
+
+  io_watcher = IOWatcher() # Create a seperate IOWatcher for this test
+  small_content, big_content = generate_rand_content(32, 1024*128)
+  buffer = bytearray()
+  def _reset_buffer(size: int):
+    buffer.clear()
+    buffer.extend(b'\x00' * size)
+
+  await io_watcher.start()
+  try:
+    for (
+      kind,
+      (rfd, wfd),
+      content,
+      content_size,
+    ) in _fd_combinations(
+      ['file',],
+      [small_content, big_content],
+    ):
+      afd = AsyncFileDescriptor(rfd, 'file', io_watcher.register(rfd, IOEvent.READ | IOEvent.ERROR | IOEvent.CLOSE))
+      try:
+        """Test 1.1 - Read `n` Bytes"""
+        logger.info("Test 1 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(0)
+        _buffer = await afd.read(content_size)
+        assert _buffer[:] == content[:], f"content mismatch: got {bytes(_buffer)}; expected {bytes(content)}"
+        logger.info("Test 1.1 Complete")
+
+        logger.info("Test 1.2 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content_size)
+        bytes_written = await afd.read(content_size, buffer, 0)
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert buffer[:] == content[:], f"content mismatch: got {bytes(buffer)}; expected {bytes(content)}"
+        logger.info("Test 1.2 Complete")
+
+        logger.info("Test 1.3 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content_size + 1)
+        bytes_written = await afd.read(content_size, buffer, 1)
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert buffer[1:] == content[:], f"content mismatch: got {bytes(buffer[1:])}; expected {bytes(content)}"
+        logger.info("Test 1.3 Complete")
+
+        """Test 2 - Read Bytes until `EOF` is encountered"""
+        logger.info("Test 2.1 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(0)
+        _buffer = await afd.read(IOCondition.EOF)
+        assert _buffer[:] == content[:], f"content mismatch: got {bytes(_buffer)}; expected {bytes(content)}"
+        logger.info("Test 2.1 Complete")
+
+        logger.info("Test 2.2 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content_size)
+        bytes_written = await afd.read(IOCondition.EOF, buffer, 0)
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert buffer[:] == content[:], f"content mismatch: got {bytes(buffer)}; expected {bytes(content)}"
+        logger.info("Test 2.2 Complete")
+
+        logger.info("Test 2.3 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content_size + 1)
+        bytes_written = await afd.read(IOCondition.EOF, buffer, 1)
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert buffer[1:] == content[:], f"content mismatch: got {bytes(buffer[1:])}; expected {bytes(content)}"
+        logger.info("Test 2.3 Complete")
+      finally:
+        io_watcher.unregister(rfd)
+  finally:
+    await io_watcher.stop()
+
+  return TestResult(TestCode.PASS)
+
+async def test_AsyncFileDescriptor_read_stream(*args, **kwargs) -> TestResult:
+  """Test Reading from an AsyncFile Descriptor backed by a stream.
+
+  """
+  from utils.concurrency.aio import (
+    IOEvent, IOCondition,
+  )
+  from utils.concurrency.aio.fd import AsyncFileDescriptor
+  from utils.concurrency.aio.watch import (
+    IOWatcher,
+  )
+
+  io_watcher = IOWatcher() # Create a seperate IOWatcher for this test
+  small_content, big_content = generate_rand_content(32, 1024*128)
+  buffer = bytearray()
+  stream_cleanup = None
+  def _reset_buffer(size: int):
+    buffer.clear()
+    buffer.extend(b'\x00' * size)
+
+  await io_watcher.start()
+  try:
+    for (
+      kind,
+      (rfd, wfd),
+      content,
+      content_size,
+    ) in _fd_combinations(
+      ['unix', 'pipe'],
+      [small_content, big_content],
+    ):
+      afd = AsyncFileDescriptor(rfd, 'stream', io_watcher.register(rfd, IOEvent.READ | IOEvent.ERROR | IOEvent.CLOSE))
+      try:
+        """Test 1.1 - Read `n` Bytes"""
+        logger.info("Test 1 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        stream_cleanup = await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(0)
+        _buffer = await afd.read(content_size)
+        _empty_bytes = await afd.read(IOCondition.BLOCK)
+        await stream_cleanup; stream_cleanup = None
+        assert _buffer[:] == content[:], f"content mismatch: got {bytes(_buffer)}; expected {bytes(content)}"
+        assert _empty_bytes == b'', f"Reading after exhausting the stream expects an empty ByteString but got `{_empty_bytes}`"
+        logger.info("Test 1.1 Complete")
+
+        logger.info("Test 1.2 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        stream_cleanup = await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content_size)
+        bytes_written = await afd.read(content_size, buffer, 0)
+        _n_is_0 = await afd.read(IOCondition.BLOCK, buffer, 0)
+        await stream_cleanup; stream_cleanup = None
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert buffer[:] == content[:], f"content mismatch: got {bytes(buffer)}; expected {bytes(content)}"
+        assert _n_is_0 == 0, f"Reading after exhausting the stream expects an a read length of 0 but got `{_n_is_0}`"
+        logger.info("Test 1.2 Complete")
+
+        logger.info("Test 1.3 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        stream_cleanup = await _set_fd_state_for_reading(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content_size + 1)
+        bytes_written = await afd.read(content_size, buffer, 1)
+        await stream_cleanup; stream_cleanup = None
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert buffer[1:] == content[:], f"content mismatch: got {bytes(buffer[1:])}; expected {bytes(content)}"
+        logger.info("Test 1.3 Complete")
+      finally:
+        io_watcher.unregister(rfd)
+  finally:
+    if stream_cleanup is not None: await stream_cleanup
+    await io_watcher.stop()
+
+  return TestResult(TestCode.PASS)
+
+async def test_AsyncFileDescriptor_write_file(*args, **kwargs) -> TestResult:
+  from utils.concurrency.aio import (
+    IOEvent,
+  )
+  from utils.concurrency.aio.fd import AsyncFileDescriptor
+  from utils.concurrency.aio.watch import (
+    IOWatcher,
+  )
+
+  io_watcher = IOWatcher() # Create a seperate IOWatcher for this test
+  reset_fd = None
+  small_content, big_content = generate_rand_content(32, 1024*128)
+  buffer = bytearray()
+  def _reset_buffer(content: bytes):
+    buffer.clear()
+    buffer.extend(content)
+
+  await io_watcher.start()
+  try:
+    for (
+      kind,
+      (rfd, wfd),
+      content,
+      content_size,
+    ) in _fd_combinations(
+      ['file',],
+      [small_content, big_content],
+    ):
+      afd = AsyncFileDescriptor(wfd, 'file', io_watcher.register(wfd, IOEvent.WRITE | IOEvent.ERROR | IOEvent.CLOSE))
+      try:
+        """Test 1.1 - Write `n` Bytes"""
+        logger.info("Test 1.1 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        (dump_fd, reset_fd) = await _set_fd_state_for_writing(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content)
+        bytes_written = await afd.write(buffer, content_size)
+        _fd_content = await dump_fd; await reset_fd; reset_fd = None
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert _fd_content[:] == content[:], f"content mismatch writing to fd{wfd}:\n{render_diff(bytes(_fd_content), bytes(content))}"
+        logger.info("Test 1.1 Complete")
+
+        logger.info("Test 1.2 Start")
+        async with afd.event_log.lock():
+          await afd.event_log.clear() # Reset the internal state of the AFD
+        (dump_fd, reset_fd) = await _set_fd_state_for_writing(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content)
+        bytes_written = await afd.write(buffer, content_size - 1, 1)
+        _fd_content = await dump_fd; await reset_fd; reset_fd = None
+        assert bytes_written == content_size - 1, f"content length mismatch: got {bytes_written}; expected {content_size - 1}"
+        assert _fd_content[:] == content[1:], f"content mismatch writing to fd{wfd}:\n{render_diff(bytes(_fd_content), bytes(content[1:]))}"
+        logger.info("Test 1.2 Complete")
+      finally:
+        io_watcher.unregister(rfd)
+  finally:
+    if reset_fd is not None: await reset_fd
+    await io_watcher.stop()
+
+  return TestResult(TestCode.PASS)
+
+async def test_AsyncFileDescriptor_write_stream(*args, **kwargs) -> TestResult:
+  from utils.concurrency.aio import (
+    IOEvent
+  )
+  from utils.concurrency.aio.fd import AsyncFileDescriptor
+  from utils.concurrency.aio.watch import (
+    IOWatcher,
+  )
+
+  io_watcher = IOWatcher() # Create a seperate IOWatcher for this test
+  reset_fd = None
+  small_content, big_content = generate_rand_content(32, 1024*128)
+  buffer = bytearray()
+  def _reset_buffer(content: bytes):
+    buffer.clear()
+    buffer.extend(content)
+
+  await io_watcher.start()
+  try:
+    for (
+      kind,
+      (rfd, wfd),
+      content,
+      content_size,
+    ) in _fd_combinations(
+      ['unix', 'pipe'],
+      [small_content, big_content],
+    ):
+      afd = AsyncFileDescriptor(wfd, 'stream', io_watcher.register(wfd, IOEvent.WRITE | IOEvent.ERROR | IOEvent.CLOSE))
+      try:
+        """Test 1.1 - Write `n` Bytes"""
+        logger.info("Test 1.1 Start")
+        (dump_fd, reset_fd) = await _set_fd_state_for_writing(kind, rfd, wfd, content, content_size)
+        _reset_buffer(content)
+        bytes_written = await afd.write(buffer, content_size)
+        _fd_content = await dump_fd; await reset_fd; reset_fd = None
+        assert bytes_written == content_size, f"content length mismatch: got {bytes_written}; expected {content_size}"
+        assert _fd_content[:] == content[:], f"content mismatch writing to fd{wfd}:\n{render_diff(bytes(_fd_content), bytes(content))}"
+        logger.info("Test 1.1 Complete")
+
+        logger.info("Test 1.2 Start")
+        (dump_fd, reset_fd) = await _set_fd_state_for_writing(kind, rfd, wfd, content, content_size - 1)
+        _reset_buffer(content)
+        bytes_written = await afd.write(buffer, content_size - 1, 1)
+        assert bytes_written == content_size - 1
+        _fd_content = await dump_fd; await reset_fd; reset_fd = None
+        assert bytes_written == content_size - 1, f"content length mismatch: got {bytes_written}; expected {content_size - 1}"
+        assert _fd_content[:] == content[1:], f"content mismatch writing to fd{wfd}:\n{render_diff(bytes(_fd_content), bytes(content[1:]))}"
+        logger.info("Test 1.2 Complete")
+      finally:
+        io_watcher.unregister(wfd)
+  finally:
+    if reset_fd is not None: await reset_fd
+    await io_watcher.stop()
+
   return TestResult(TestCode.PASS)
