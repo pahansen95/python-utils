@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, KW_ONLY
-import select, enum, time, os
-import asyncio
+import select, enum, time, os, asyncio, fcntl
 from . import (
   aio_backend, AIOBackend,
   IOErrorReason, IOEvent,
@@ -126,7 +125,14 @@ class IOWatcher:
       watch_backend: WatchBackend - Which Backend to use for watching; if it fails then the next best backend will be tried until one suceeeds or all fail; Defaults to the highest priority backend
     """
     
+    # Sanity Checks
     if os.get_blocking(fd): raise ValueError("File Descriptor must be non-blocking")
+    fd_acc_modes = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+    logger.trace(f"fd:{fd} Access Modes `{fd_acc_modes:>08b}`")
+    fd_readable = bool(fd_acc_modes & os.O_RDONLY) or bool(fd_acc_modes & os.O_RDWR)
+    fd_writeable = bool(fd_acc_modes & os.O_WRONLY) or bool(fd_acc_modes & os.O_RDWR)
+    if eventmask & IOEvent.READ and not fd_readable: logger.warning(f"fd:{fd} didn't seem to be opened in a readable mode; is this intentional?")
+    if eventmask & IOEvent.WRITE and not fd_writeable: logger.warning(f"fd:{fd} didn't seem to be opened in a writable mode; is this intentional?")
 
     if fd in self.fds:
       _backend, _mask = self.fds[fd]
@@ -142,13 +148,13 @@ class IOWatcher:
       self.fds[fd] = (selected_backend, eventmask)
       self._ctx.event_logs[fd] = ItemLog()
 
-    logger.trace(f"fd {fd} was registered with {watch_backend.name}")
+    # logger.trace(f"fd {fd} was registered with {watch_backend.name}")
     return self._ctx.event_logs[fd]
   
   def unregister(self, fd: int) -> ItemLog[IOEvent]:
     """Unregister a File Descriptor from the Epoll; returns the IO Event Log containing any remaining Events for the File Descriptor."""
     if fd not in self.fds: raise ValueError("fd is not registered")
-    logger.trace(f"Unregistering File Descriptor {fd}")
+    # logger.trace(f"Unregistering File Descriptor {fd}")
     try:
       if self.fds[fd][0] == WatchBackend.EPOLL: self.epoll.unregister(fd)
       elif self.fds[fd][0] == WatchBackend.POLL: self.poll.unregister(fd)
@@ -167,23 +173,23 @@ class IOWatcher:
       # logger.trace(f"Setting Events {eventmask=}, {backend.name=} on the IO Log")
       _len = len(iolog)
       if backend == WatchBackend.EPOLL: # EPoll is edge triggered (notify on change) so we want to push all events
-        # if eventmask & _epoll_event_map[IOEvent.READ]: await iolog.push(IOEvent.READ)
-        # if eventmask & _epoll_event_map[IOEvent.WRITE]: await iolog.push(IOEvent.WRITE)
-        # if eventmask & _epoll_event_map[IOEvent.ERROR]: await iolog.push(IOEvent.ERROR)
-        # if eventmask & _epoll_event_map[IOEvent.CLOSE]: await iolog.push(IOEvent.CLOSE)
-        if eventmask & _epoll_event_map[IOEvent.READ]:  logger.trace(f"{backend.name}::READ"); await iolog.push(IOEvent.READ)
-        if eventmask & _epoll_event_map[IOEvent.WRITE]: logger.trace(f"{backend.name}::WRITE"); await iolog.push(IOEvent.WRITE)
-        if eventmask & _epoll_event_map[IOEvent.ERROR]: logger.trace(f"{backend.name}::ERROR"); await iolog.push(IOEvent.ERROR)
-        if eventmask & _epoll_event_map[IOEvent.CLOSE]: logger.trace(f"{backend.name}::CLOSE"); await iolog.push(IOEvent.CLOSE)
+        if eventmask & _epoll_event_map[IOEvent.READ]: await iolog.push(IOEvent.READ)
+        if eventmask & _epoll_event_map[IOEvent.WRITE]: await iolog.push(IOEvent.WRITE)
+        if eventmask & _epoll_event_map[IOEvent.ERROR]: await iolog.push(IOEvent.ERROR)
+        if eventmask & _epoll_event_map[IOEvent.CLOSE]: await iolog.push(IOEvent.CLOSE)
+        # if eventmask & _epoll_event_map[IOEvent.READ]:  logger.trace(f"{backend.name}::READ"); await iolog.push(IOEvent.READ)
+        # if eventmask & _epoll_event_map[IOEvent.WRITE]: logger.trace(f"{backend.name}::WRITE"); await iolog.push(IOEvent.WRITE)
+        # if eventmask & _epoll_event_map[IOEvent.ERROR]: logger.trace(f"{backend.name}::ERROR"); await iolog.push(IOEvent.ERROR)
+        # if eventmask & _epoll_event_map[IOEvent.CLOSE]: logger.trace(f"{backend.name}::CLOSE"); await iolog.push(IOEvent.CLOSE)
       elif backend == WatchBackend.POLL: # Poll isn't edge triggered so we only want to push any events once.
-        # if eventmask & _poll_event_map[IOEvent.READ] and IOEvent.READ not in iolog: await iolog.push(IOEvent.READ)
-        # if eventmask & _poll_event_map[IOEvent.WRITE] and IOEvent.WRITE not in iolog: await iolog.push(IOEvent.WRITE)
-        # if eventmask & _poll_event_map[IOEvent.ERROR] and IOEvent.ERROR not in iolog: await iolog.push(IOEvent.ERROR)
-        # if eventmask & _poll_event_map[IOEvent.CLOSE] and IOEvent.CLOSE not in iolog: await iolog.push(IOEvent.CLOSE)
-        if eventmask & _poll_event_map[IOEvent.READ] and IOEvent.READ not in iolog:  logger.trace(f"{backend.name}::READ"); await iolog.push(IOEvent.READ)
-        if eventmask & _poll_event_map[IOEvent.WRITE] and IOEvent.WRITE not in iolog: logger.trace(f"{backend.name}::WRITE"); await iolog.push(IOEvent.WRITE)
-        if eventmask & _poll_event_map[IOEvent.ERROR] and IOEvent.ERROR not in iolog: logger.trace(f"{backend.name}::ERROR"); await iolog.push(IOEvent.ERROR)
-        if eventmask & _poll_event_map[IOEvent.CLOSE] and IOEvent.CLOSE not in iolog: logger.trace(f"{backend.name}::CLOSE"); await iolog.push(IOEvent.CLOSE)
+        if eventmask & _poll_event_map[IOEvent.READ] and IOEvent.READ not in iolog: await iolog.push(IOEvent.READ)
+        if eventmask & _poll_event_map[IOEvent.WRITE] and IOEvent.WRITE not in iolog: await iolog.push(IOEvent.WRITE)
+        if eventmask & _poll_event_map[IOEvent.ERROR] and IOEvent.ERROR not in iolog: await iolog.push(IOEvent.ERROR)
+        if eventmask & _poll_event_map[IOEvent.CLOSE] and IOEvent.CLOSE not in iolog: await iolog.push(IOEvent.CLOSE)
+        # if eventmask & _poll_event_map[IOEvent.READ] and IOEvent.READ not in iolog:  logger.trace(f"{backend.name}::READ"); await iolog.push(IOEvent.READ)
+        # if eventmask & _poll_event_map[IOEvent.WRITE] and IOEvent.WRITE not in iolog: logger.trace(f"{backend.name}::WRITE"); await iolog.push(IOEvent.WRITE)
+        # if eventmask & _poll_event_map[IOEvent.ERROR] and IOEvent.ERROR not in iolog: logger.trace(f"{backend.name}::ERROR"); await iolog.push(IOEvent.ERROR)
+        # if eventmask & _poll_event_map[IOEvent.CLOSE] and IOEvent.CLOSE not in iolog: logger.trace(f"{backend.name}::CLOSE"); await iolog.push(IOEvent.CLOSE)
       else: raise NotImplementedError(backend)
       # logger.trace(f"Set {len(iolog) - _len} Events on the IO Log")
       # assert backend == WatchBackend.EPOLL and len(iolog) > _len or backend == WatchBackend.POLL and len(iolog) >= _len
@@ -195,24 +201,19 @@ class IOWatcher:
       while True:
         # logger.trace("Polling for IO Events")
         if count > 0: # If we polled more than once w/out any new events then backoff
-          logger.trace(f"Backoff: {count}")
+          # logger.trace(f"Backoff: {count}")
           # if count == 0: datum = time.monotonic_ns()
           _duration = self.backoff.remaining_wait_time(_now(), count)
           # logger.trace(f"Waiting for {_duration}ns")
           await asyncio.sleep(_duration / 1E9)
           # datum = time.monotonic_ns()
         
-        try:
-          # assert isinstance(self.epoll, select.epoll)
-          _epoll_events = self.epoll.poll(timeout=0)
-          # logger.trace(f"Received {len(_epoll_events)} EPoll Events")
-          # assert isinstance(self.poll, select.poll)
-          _poll_events = self.poll.poll(0)
-          # _poll_events = []
-          # logger.trace(f"Received {len(_poll_events)} Poll Events")
-        except:
-          logger.opt(exception=True).trace("Error while polling for IO Events")
-          raise
+        # assert isinstance(self.epoll, select.epoll)
+        _epoll_events = self.epoll.poll(timeout=0)
+        # logger.trace(f"Received {len(_epoll_events)} EPoll Events")
+        # assert isinstance(self.poll, select.poll)
+        _poll_events = self.poll.poll(0)
+        # logger.trace(f"Received {len(_poll_events)} Poll Events")
 
         epoll_sum = sum(await asyncio.gather(*(
           _set_events(
@@ -232,30 +233,7 @@ class IOWatcher:
         # logger.trace(f"A Total of {poll_sum} Poll Events were recorded")
         if epoll_sum + poll_sum > 0: count = 0
         else: count += 1
-
-        # fd_events: list[tuple[int, int]] = [*_epoll_events, *_poll_events]
-        # # logger.trace(f"{fd_events=}")
-        # # fd_events: list[tuple[int, int]] = [*self.epoll.poll(timeout=0), *self.poll.poll(timeout=0)]
-        # # If no events were returned, then wait some before polling again
-        # if len(fd_events) < 1:
-        #   # logger.trace("No IO Events")
-        #   if count == 0: datum = time.monotonic_ns()
-        #   _duration = self.backoff.remaining_wait_time(datum, count)
-        #   # logger.trace(f"Waiting for {_duration}ns")
-        #   await asyncio.sleep(_duration / 1E9)
-        #   datum = time.monotonic_ns()
-        #   count += 1
-        #   continue
-        # # logger.trace(f"Received {len(fd_events)} IO Events")
-        # count = 0
-        # added_counts = await asyncio.gather(*(_set_events(self._ctx.event_logs[fd], events, self.fds[fd][0]) for fd, events in fd_events if fd in self.fds))
-        # # epoll_sum = sum(filter(lambda fd: self.fds[fd][0] == WatchBackend.EPOLL, zip(added_counts, (fd for fd, _ in fd_events))))
-        # poll_sum = sum(filter(lambda fd: self.fds[fd][0] == WatchBackend.POLL, zip(added_counts, (fd for fd, _ in fd_events))))
-        # if poll_sum < 1:
-          
-        # await asyncio.sleep(0) # Yield to the Event Loop
-    except asyncio.CancelledError:
-      raise
+    except asyncio.CancelledError: raise
     except:
       logger.opt(exception=True).error("Unhandled Error in IO Watch Loop")
       raise
@@ -270,8 +248,7 @@ class IOWatcher:
     if self._ctx.watch_task is None: raise RuntimeError("Epoll is not started")
     try:
       if self._ctx.watch_task.cancel(): await self._ctx.watch_task
-    except asyncio.CancelledError:
-      logger.trace("Watch Task Cancelled")
+    except asyncio.CancelledError: logger.trace("Watch Task Cancelled")
     logger.trace("Epoll Stopped")
     self._ctx.watch_task = None
   

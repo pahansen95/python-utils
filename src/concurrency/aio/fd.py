@@ -3,7 +3,7 @@ from dataclasses import dataclass, field, KW_ONLY
 import asyncio, os, sys, fcntl
 from loguru import logger
 from collections.abc import Coroutine, Callable
-from typing import TypeVar, Any
+from typing import TypeVar, Any, Literal, ByteString
 from . import (
   aio_backend, AIOBackend,
   IOErrorReason, IOEvent, IOCondition,
@@ -28,8 +28,13 @@ class AsyncFileDescriptor:
 
   fd: int
   """The (already opened) File Descriptor."""
+  kind: Literal['file','stream']
+  """The type of FileDescriptor we are read/writing from"""
   event_log: ItemLog[IOEvent] = field(default_factory=ItemLog)
   """The Events that occurred on the File Descriptor."""
+
+  def __post_init__(self):
+    if self.kind not in ('file', 'stream'): raise ValueError(f"Invalid FD Kind `{self.kind}`")
 
   @property
   def closed(self) -> bool:
@@ -40,61 +45,38 @@ class AsyncFileDescriptor:
     except OSError:
       return True
 
-  # @_log_trapper
-  async def read(
-    self,
-    n: int | IOCondition,
-    buffer: bytearray | memoryview | None = None,
-    buffer_offset: int = 0,
-  ) -> bytes | int:
-    """Read N Bytes from the File Descriptor or until EOF is reached. Return the buffer as bytes or the total bytes read if a buffer was provided."""
-    _n_is_flag: bool = isinstance(n, IOCondition)
-    if not _n_is_flag and n <= 0: raise ValueError("n must be greater than 0")
-    if buffer_offset < 0 or (buffer is not None and buffer_offset >= len(buffer)): raise ValueError("buffer offset out of bounds")
-    if (not _n_is_flag and buffer is not None) and n + buffer_offset > len(buffer): raise ValueError(f"Reading up to {n} bytes starting at buffer idx {buffer_offset} will exceed the buffer size of {len(buffer)}")
-    logger.trace(f"fd{self.fd} - Reading " + (f"up to {n} bytes" if not _n_is_flag else f"until {n.name}"))
-    # fd sanity checks are handled by fd_read
-    _bytes_read: int = 0
-    if buffer is None: _buffer = bytearray(4 * CHUNK_SIZE if _n_is_flag else n); _buffer_offset = 0
-    else: _buffer = buffer; _buffer_offset = buffer_offset
-
+  async def _read(self, n: int) -> bytes:
+    """Read N Bytes returning a bytes string"""
+    # Initialize state
+    if n <= 0: raise ValueError("n must be greater than 0")
+    buffer = bytearray(n)
     err: IOErrorReason = IOErrorReason.NONE
-    fd_event: IOEvent = IOEvent.ERROR # We are just initializing this variable
-    if _n_is_flag: _n = CHUNK_SIZE if buffer is None else (len(buffer) - buffer_offset) # Read the default chunk size or the size of the buffer starting from the offset.
-    else: _n = n # Read N bytes as instructed
-    
-    while True:
-      # If the Internal buffer is nearly fully then extend it so that we can always fit at least CHUNK_SIZE
-      if buffer is None and len(_buffer) - _bytes_read < CHUNK_SIZE: logger.trace(f"fd{self.fd} - Extending the Internal buffer"); _buffer.extend(bytearray(4 * CHUNK_SIZE)) # Extend by 64K
-      logger.trace(f"fd{self.fd} - Bytes Read {_bytes_read}/{len(_buffer)}")
-      logger.trace(f"The current IOLog {id(self.event_log)} is {list(self.event_log)}")
-      fd_event: IOEvent | None = await self.event_log.peek()
-      logger.trace(f"fd{self.fd} - Event: {fd_event.name}")
+    fd_event: IOEvent = IOEvent.ERROR
+    total_bytes_read = 0
 
-      # Attempt to read if there is a READ available or the FD is in a CLOSE state; the goal is to drain the kernel buffer before breaking (unless if we read the instructed amount of bytes or the buffer is full)
+    # Start reading
+    while True:
+      fd_event: IOEvent | None = await self.event_log.peek()
+      # Attempt to read
       if fd_event == IOEvent.READ or fd_event == IOEvent.CLOSE:
-        if _n_is_flag and buffer is None: _n = CHUNK_SIZE # If using an internal Buffer, read the default amount.
-        elif _n_is_flag and buffer is not None: _n = len(_buffer) - _buffer_offset - _bytes_read # If using an external Buffer, read up to the remaining space in the buffer
-        else: _n = n - _bytes_read # Otherwise Read the remaining bytes instructed irrespective of buffer sizes
-        err, _read = fd_read(self.fd, _n, _buffer, _buffer_offset + _bytes_read)
-        logger.trace(f"fd{self.fd} - Bytes Read: {_read}, IOErrorReason: {err.name}")
-      elif fd_event == IOEvent.CLOSE: break
+        assert total_bytes_read < n # NOTE: I don't think we should ever encounter this state
+        err, bytes_read = fd_read(self.fd, n - total_bytes_read, buffer, total_bytes_read)
       elif fd_event == IOEvent.ERROR: raise AIOError(IOErrorReason.ERROR, f"error reading from file descriptor {self.fd}")
       else: raise NotImplementedError(fd_event)
-    
-      assert fd_event == IOEvent.READ
-      assert isinstance(_read, int)
-      _bytes_read += _read
 
-      # Evaluate if the Read event should be consumed: when no bytes are returned during a read or the fd is in a non-readable state
+      total_bytes_read += bytes_read
+      
+      ### NOTE: Event Handling
+      # Conditions when the IOEvent should be consumed from the Event Log:
+      #   - when no bytes are returned during a read
+      #   - the fd is no longer ready to be read from
+      ###
       if (
-        (err == IOErrorReason.NONE and _read <= 0)
-        or err == IOErrorReason.BLOCK
-        or err == IOErrorReason.EOF
+        (err == IOErrorReason.NONE and bytes_read <= 0)
+        or (err == IOErrorReason.BLOCK or err == IOErrorReason.EOF)
       ): await self.event_log.pop()
 
-      # Flow Control - Break if no more can be read, or we have met instructed requirements
-      # """NOTE: Flow Control
+      ### NOTE: Flow Control - Break if no more can be read, or we have met instructed requirements
       # 
       # When should we error out?
       # 
@@ -102,95 +84,267 @@ class AsyncFileDescriptor:
       # 
       # When should we break?
       # 
-      # - if n is flag:
-      #   - if IO Error matches n: Break
-      #   - if using a Provided Buffer AND buffer is full: Break
-      # - if n is int:
-      #   - bytes read is n: Break
-      #   - if using a Provided Buffer AND buffer is full: Break
+      # - total_bytes_read >= n: Break
+      # - if IOError one of EOF|BLOCK|CLOSED: Break
+      # 
+      # When should we continue?
+      # 
+      # - if IOError one of NONE|INTERRUPT: Continue
+      #  
+      # NOTES:
+      # 
+      # - For Streams, a BlOCK event is the equivalent of a EOF for a File.
+      # - The Most Common Error Reason is NONE followed by EOF/BLOCK
+      #
+      ###
+
+      if total_bytes_read >= n or (err == IOErrorReason.EOF or err == IOErrorReason.CLOSED): break
+      elif err == IOErrorReason.BLOCK or err == IOErrorReason.NONE or err == IOErrorReason.INTERRUPT: continue
+      elif err == IOErrorReason.ERROR or err == IOErrorReason.UNHANDLED: raise AIOError(err, f"error writing to file descriptor {self.fd}")
+      else: raise NotImplementedError(f"Unhandled State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesRead={total_bytes_read},LastBytesRead={bytes_read}")
+
+    return bytes(buffer[:total_bytes_read])
+
+  async def _read_into(self, n: int, buffer: bytearray | memoryview, buffer_offset: int) -> int:
+    """Read N Bytes into a Fixed Size Buffer"""
+    # Initialize state
+    if n <= 0: raise ValueError("n must be greater than 0")
+    err: IOErrorReason = IOErrorReason.NONE
+    fd_event: IOEvent = IOEvent.ERROR
+    total_bytes_read = 0
+    buf_size = len(buffer) - buffer_offset
+    if buf_size < n: raise ValueError(f"Buffer is too small: needs {n} bytes but has {buf_size} bytes available after offset of {buffer_offset} bytes")
+
+    # Start reading
+    while True:
+      fd_event: IOEvent | None = await self.event_log.peek()
+      # Attempt to read
+      if fd_event == IOEvent.READ or fd_event == IOEvent.CLOSE:
+        assert total_bytes_read < n # NOTE: I don't think we should ever encounter this state
+        assert n - total_bytes_read <= buf_size - total_bytes_read # NOTE: We shouldn't ever be able to read into the buffer past it's end
+        err, bytes_read = fd_read(self.fd, n - total_bytes_read, buffer, buffer_offset + total_bytes_read)
+      elif fd_event == IOEvent.ERROR: raise AIOError(IOErrorReason.ERROR, f"error reading from file descriptor {self.fd}")
+      else: raise NotImplementedError(fd_event)
+
+      total_bytes_read += bytes_read
+      
+      ### NOTE: Event Handling
+      # Conditions when the IOEvent should be consumed from the Event Log:
+      #   - when no bytes are returned during a read
+      #   - the fd is no longer ready to be read from
+      ###
+      if (
+        (err == IOErrorReason.NONE and bytes_read <= 0)
+        or (err == IOErrorReason.BLOCK or err == IOErrorReason.EOF)
+      ): await self.event_log.pop()
+
+      ### NOTE: Flow Control - Break if no more can be read, or we have met instructed requirements
+      # 
+      # When should we error out?
+      # 
+      # - If IO Error is ERROR or UNHANDLED: Raise an AIOError
+      # 
+      # When should we break?
+      # 
+      # - total_bytes_read >= n: Break
+      # - if IOError one of EOF|BLOCK|CLOSED: Break
+      # > NOTE: The Buffer can never be smaller than the total amount of bytes being read; so no need to check if the buffer is full
+      # 
+      # When should we continue?
+      # 
+      # - if IOError one of NONE|INTERRUPT: Continue
+      #  
+      # NOTES:
+      # 
+      # - For Streams, a BlOCK event is the equivalent of a EOF for a File.
+      # - The Most Common Error Reason is NONE followed by EOF/BLOCK
+      #
+      ###
+
+      if total_bytes_read >= n or (err == IOErrorReason.EOF or err == IOErrorReason.CLOSED): break
+      elif err == IOErrorReason.BLOCK or err == IOErrorReason.NONE or err == IOErrorReason.INTERRUPT: continue
+      elif err == IOErrorReason.ERROR or err == IOErrorReason.UNHANDLED: raise AIOError(err, f"error writing to file descriptor {self.fd}")
+      else: raise NotImplementedError(f"Unhandled State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesRead={total_bytes_read},LastBytesRead={bytes_read}")
+
+    return total_bytes_read
+
+  async def _read_until(self, n: IOCondition) -> bytes:
+    """Read until a IOCondition returning the bytes read"""
+    if self.kind == 'stream' and n == IOCondition.EOF: raise ValueError('A Streaming FD never encounters a EOF')
+
+    # Initialize state
+    buffer = bytearray(4 * CHUNK_SIZE) # This Buffer is not fixed size; we will need to continuosly grow it
+    err: IOErrorReason = IOErrorReason.NONE
+    fd_event: IOEvent = IOEvent.ERROR
+    total_bytes_read = 0
+
+    # Start reading
+    while True:
+      if len(buffer) - total_bytes_read < CHUNK_SIZE: buffer.extend(bytearray(4 * CHUNK_SIZE)) # Grow the Buffer
+      fd_event: IOEvent | None = await self.event_log.peek()
+      # Attempt to read
+      if fd_event == IOEvent.READ or fd_event == IOEvent.CLOSE: err, bytes_read = fd_read(self.fd, CHUNK_SIZE, buffer, total_bytes_read)
+      elif fd_event == IOEvent.ERROR: raise AIOError(IOErrorReason.ERROR, f"error reading from file descriptor {self.fd}")
+      else: raise NotImplementedError(fd_event)
+
+      total_bytes_read += bytes_read
+      
+      ### NOTE: Event Handling
+      # Conditions when the IOEvent should be consumed from the Event Log:
+      #   - when no bytes are returned during a read
+      #   - the fd is no longer ready to be read from
+      ###
+      if (
+        (err == IOErrorReason.NONE and bytes_read <= 0)
+        or (err == IOErrorReason.BLOCK or err == IOErrorReason.EOF)
+      ): await self.event_log.pop()
+
+      ### NOTE: Flow Control - Break if no more can be read, or we have met instructed requirements
+      # 
+      # When should we error out?
+      # 
+      # - If IO Error is ERROR or UNHANDLED: Raise an AIOError
+      # 
+      # When should we break?
+      # 
+      # - if IO Error matches n: Break
       # - if IO Error is EOF/BLOCK or CLOSED: Break
       # 
       # When should we continue?
       # 
-      # - If IO Error is NONE or INTERRUPT: Continue
+      # - if IOError one of NONE|INTERRUPT: Continue
       #  
       # NOTES:
       # 
-      # - When Reading, a Block event is the EOF equivalent for a stream
+      # - For Streams, a BlOCK event is the equivalent of a EOF for a File.
       # - The Most Common Error Reason is NONE followed by EOF/BLOCK
-      # 
-      # """
-      if _n_is_flag and err.value == n.value: break # We encountered the flag condition
-      elif _n_is_flag and buffer is not None and _bytes_read + buffer_offset >= len(buffer): break # We met the read quota
-      elif (not _n_is_flag) and _bytes_read >= n: assert _bytes_read == n; break # We met the read quota
-      elif (not _n_is_flag) and buffer is not None and _bytes_read + buffer_offset >= len(buffer): assert _bytes_read + buffer_offset == len(buffer); break # We met the read quota
-      elif (err == IOErrorReason.BLOCK or err == IOErrorReason.EOF) or err == IOErrorReason.CLOSED: break # No More can be read
-      elif err == IOErrorReason.NONE or err == IOErrorReason.INTERRUPT: continue
-      elif err == IOErrorReason.ERROR or err == IOErrorReason.UNHANDLED: raise AIOError(err, f"error reading from file descriptor {self.fd}")
-      else: raise NotImplementedError(f"Unhandled State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesRead={_bytes_read},LastBytesRead={_read}")
+      #
+      ###
 
-      # if err == IOErrorReason.NONE or err == IOErrorReason.INTERRUPT: continue
-      # if err == IOErrorReason.BLOCK or err == IOErrorReason.EOF or err == IOErrorReason.CLOSED: break # No More can be read
-      # elif _n_is_flag and err.value == n.value: break # We encountered the flag condition
-      # elif (not _n_is_flag and _bytes_read >= n) or (buffer is not None and _bytes_read + buffer_offset >= len(buffer)): # We met the read quota
-      #   assert _bytes_read == n or _bytes_read + buffer_offset == len(buffer)
-      #   break
-      # elif err == IOErrorReason.ERROR or err == IOErrorReason.UNHANDLED: # An Error occured
-      #   raise AIOError(err, f"error reading from file descriptor {self.fd}")
-      # else: raise NotImplementedError(f"Unhandled Read State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesRead={_bytes_read},LastBytesWritten={_read}")
+      if err.value == n.value or (err == IOErrorReason.EOF or err == IOErrorReason.CLOSED): break # We encountered the IOCondition
+      elif err == IOErrorReason.BLOCK or err == IOErrorReason.NONE or err == IOErrorReason.INTERRUPT: continue
+      elif err == IOErrorReason.ERROR or err == IOErrorReason.UNHANDLED: raise AIOError(err, f"error writing to file descriptor {self.fd}")
+      else: raise NotImplementedError(f"Unhandled State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesRead={total_bytes_read},LastBytesRead={bytes_read}")
+
+    return bytes(buffer[:total_bytes_read])
     
-    logger.trace(f"fd{self.fd} - Read a total of {_bytes_read} bytes")
-    return bytes(_buffer[:_bytes_read]) if buffer is None else _bytes_read
+  async def _read_until_into(self, n: IOCondition, buffer: bytearray | memoryview, buffer_offset: int) -> int:
+    """Read into a Buffer until a IOCondition or the buffer is full"""
+    if self.kind == 'stream' and n == IOCondition.EOF: raise ValueError('A Streaming FD never encounters a EOF')
 
-  # @_log_trapper
+    # Initialize state
+    err: IOErrorReason = IOErrorReason.NONE
+    fd_event: IOEvent = IOEvent.ERROR
+    total_bytes_read = 0
+    buf_size = len(buffer) - buffer_offset
+    buf_size_left = buf_size
+
+    # Start reading
+    while True:
+      fd_event: IOEvent | None = await self.event_log.peek()
+      # Attempt to read
+      if fd_event == IOEvent.READ or fd_event == IOEvent.CLOSE:
+        assert total_bytes_read < buf_size # NOTE: I don't think we should ever encounter this state
+        # Make sure we don't read past the buffer's capacity
+        buf_size_left = buf_size - total_bytes_read
+        if CHUNK_SIZE < buf_size_left: _n = CHUNK_SIZE
+        else: _n = buf_size_left
+        assert _n > 0 # NOTE: We shouldn't ever reach these states
+        err, bytes_read = fd_read(self.fd, _n, buffer, buffer_offset + total_bytes_read)
+      elif fd_event == IOEvent.ERROR: raise AIOError(IOErrorReason.ERROR, f"error reading from file descriptor {self.fd}")
+      else: raise NotImplementedError(fd_event)
+
+      total_bytes_read += bytes_read
+      
+      ### NOTE: Event Handling
+      # Conditions when the IOEvent should be consumed from the Event Log:
+      #   - when no bytes are returned during a read
+      #   - the fd is no longer ready to be read from
+      ###
+      if (
+        (err == IOErrorReason.NONE and bytes_read <= 0)
+        or (err == IOErrorReason.BLOCK or err == IOErrorReason.EOF)
+      ): await self.event_log.pop()
+
+      ### NOTE: Flow Control - Break if no more can be read, or we have met instructed requirements
+      # 
+      # When should we error out?
+      # 
+      # - If IO Error is ERROR or UNHANDLED: Raise an AIOError
+      # 
+      # When should we break?
+      # 
+      # - if IOError == n: Break
+      # - if buffer is full: Break
+      # - if IOError one of EOF|BLOCK|CLOSED: Break
+      # > NOTE: The Buffer can never be smaller than the total amount of bytes being read; so no need to check if the buffer is full
+      # 
+      # When should we continue?
+      # 
+      # - if IOError one of NONE|INTERRUPT: Continue
+      #  
+      # NOTES:
+      # 
+      # - For Streams, a BlOCK event is the equivalent of a EOF for a File.
+      # - The Most Common Error Reason is NONE followed by EOF/BLOCK
+      #
+      ###
+
+      if err.value == n.value or total_bytes_read >= buf_size or (err == IOErrorReason.EOF or err == IOErrorReason.CLOSED): break
+      elif err == IOErrorReason.BLOCK or err == IOErrorReason.NONE or err == IOErrorReason.INTERRUPT: continue
+      elif err == IOErrorReason.ERROR or err == IOErrorReason.UNHANDLED: raise AIOError(err, f"error writing to file descriptor {self.fd}")
+      else: raise NotImplementedError(f"Unhandled State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesRead={total_bytes_read},LastBytesRead={bytes_read}")
+
+    return total_bytes_read
+
+  async def read(
+    self,
+    n: int | IOCondition,
+    buffer: bytearray | memoryview | None = None,
+    buffer_offset: int = 0,
+  ) -> bytes | int:
+    """Read N Bytes from the File Descriptor or until EOF is reached. Return the buffer as bytes or the total bytes read if a buffer was provided."""
+    # Dispatch the call to the underlying read implementation
+    if isinstance(n, IOCondition):
+      if buffer is None: return await self._read_until(n)
+      else: return await self._read_until_into(n, buffer, buffer_offset)
+    else:
+      if buffer is None: return await self._read(n)
+      else: return await self._read_into(n, buffer, buffer_offset)
+
   async def write(
     self,
-    buffer: bytes | bytearray | memoryview,
+    buffer: ByteString,
     n: int,
     buffer_offset: int = 0,
   ) -> int:
     """Write N bytes from buffer starting at the buffer offset into the File Descriptor."""
-    if buffer_offset < 0 or buffer_offset >= len(buffer): raise ValueError("buffer offset out of bounds")
-    if n < 1: raise ValueError("must write at least 1 byte")
-    
-    logger.trace(f"fd{self.fd} - Writing {n} bytes")
 
-    _bytes_written: int = 0
+    total_bytes_written = 0
     err: IOErrorReason = IOErrorReason.NONE
     fd_event: IOEvent = IOEvent.ERROR
-    # while _bytes_written < n:
     while True:
-      logger.trace(f"fd{self.fd} - Bytes Written {_bytes_written}/{n}")
-      fd_event: IOEvent | None = await self.event_log.peek()
-      logger.trace(f"fd{self.fd} - Event: {fd_event.name}")
+      fd_event: IOEvent = await self.event_log.peek()
+      assert fd_event is not None
       if fd_event == IOEvent.WRITE:
-        err, _written = fd_write(self.fd, buffer, n - _bytes_written, buffer_offset + _bytes_written)
-        logger.trace(f"fd{self.fd} - Error: {err.name}, Bytes Written: {_written}")
+        err, bytes_written = fd_write(self.fd, buffer, n - total_bytes_written, buffer_offset + total_bytes_written)
+        if err == IOErrorReason.NONE: assert bytes_written > 0
       elif fd_event == IOEvent.CLOSE: break
       elif fd_event == IOEvent.ERROR: raise AIOError(IOErrorReason.ERROR, f"error writing to file descriptor {self.fd}")
       else: raise NotImplementedError(fd_event)
 
-      assert fd_event == IOEvent.WRITE
-      assert isinstance(_written, int)
-      _bytes_written += _written
+      total_bytes_written += bytes_written
 
-      # Evaluate if the WRITE Event should be consumed
-      if (
-        (err == IOErrorReason.NONE and _written == 0)
-        or err == IOErrorReason.BLOCK
-        or err == IOErrorReason.EOF
-        or err == IOErrorReason.CLOSED
-      ):
-        logger.trace(f"fd{self.fd} - Consuming WRITE Event")
-        await self.event_log.pop()
+      # Evaluate if the Event should be consumed
+      if fd_event == IOEvent.WRITE and (
+        err == IOErrorReason.BLOCK or err == IOErrorReason.CLOSED
+      ): await self.event_log.pop()
 
       # Flow Control - Break if we have written the entire buffer or we encountered some sort of error state
-      # NOTE: If a fd blocks, we just have to wait until the buffer is drained before trying to write more; this is not like async reads where a BLOCK is the streaming equivalent of a EOF
-      if _bytes_written >= n: assert _bytes_written == n; break
-      elif err == IOErrorReason.EOF or err == IOErrorReason.CLOSED: break
+      # NOTE: If a fd blocks, we just have to wait until the buffer is drained before trying to write more
+      if total_bytes_written >= n or err == IOErrorReason.CLOSED: break
       elif err == IOErrorReason.BLOCK or err == IOErrorReason.NONE or err == IOErrorReason.INTERRUPT: continue
       elif err == IOErrorReason.ERROR or err == IOErrorReason.UNHANDLED: raise AIOError(err, f"error writing to file descriptor {self.fd}")
-      else: raise NotImplementedError(f"Unhandled State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesWritten={_bytes_written},LastBytesWritten={_written}")
+      else: raise NotImplementedError(f"Unhandled State encountered: IOErrorReason={err.name},IOEvent={fd_event.name},TotalBytesWritten={total_bytes_written},LastBytesWritten={bytes_written}")
     
-    logger.trace(f"fd{self.fd} - Wrote a total of {_bytes_written} bytes")
-    return _bytes_written
+    return total_bytes_written
