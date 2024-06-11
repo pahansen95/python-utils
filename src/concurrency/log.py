@@ -4,7 +4,7 @@ Implements an Asynchronous Log of Items for tracking events over time
 
 """
 from __future__ import annotations
-from typing import Generic, TypeVar, AsyncGenerator, Iterable, AsyncIterable, Protocol
+from typing import Generic, TypeVar, AsyncGenerator, Iterable, AsyncIterable, Protocol, Literal
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from collections import deque
@@ -26,10 +26,6 @@ class Log(Generic[I], Protocol):
   """The Item Log"""
   mutex: asyncio.Lock
   """The Async Lock for Mutually Exclusive Access to the Log"""
-  item_added: asyncio.Event
-  """The Async Event that tracks when Items are added to the Item Log; It's the caller's responsibility to clear the flag."""
-  item_removed: asyncio.Event
-  """The Async Event that tracks when Items are removed from the Item Log; It's the caller's responsibility to clear the flag."""
 
   @abstractmethod
   def __len__(self) -> int:
@@ -117,18 +113,18 @@ class Log(Generic[I], Protocol):
     ...
 
   @abstractmethod
-  async def peek(self, block: bool = True) -> I | None:
-    """Peek at the head of the Log (or None if non-blocking & log is empty); does not remove the Item. Caller does not need to lock the log."""
+  async def peek(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> I | None:
+    """Peek at the head or tails of the Log (or None if non-blocking & log is empty); does not remove the Item. Caller does not need to lock the log."""
     ...
 
   @abstractmethod
-  async def pop(self, block: bool = True) -> I:
-    """Pop the head of the Log (or None if non-blocking & log is empty). Caller does not need to lock the log."""
+  async def pop(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> I:
+    """Pop the head or tail of the Log (or None if non-blocking & log is empty). Caller does not need to lock the log."""
     ...
 
   @abstractmethod
-  async def push(self, item: I, block: bool = True) -> None | I:
-    """Push an Item onto the Log at the tail (or returns the item if non-blocking & log is full). Caller does not need to lock the log."""
+  async def push(self, item: I, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> None | I:
+    """Push an Item onto the Log at the head or tail (or returns the item if non-blocking & log is full). Caller does not need to lock the log."""
     ...
 
 def _create_event(state: bool) -> asyncio.Event:
@@ -243,8 +239,8 @@ class ItemLog(Log[I]):
     self._ctx.full.clear()
     self._ctx.not_full.set()
 
-  async def peek(self, block: bool = True) -> I | None:
-    """Peek at the head of the Log (or None if non-blocking & log is empty); does not remove the Item. Caller does not need to lock the log."""
+  async def peek(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> I | None:
+    """Return the head of the Log (by default) without removing it; if non-blocking & log is empty return None. Caller does not need to lock the log."""
     while True:
       # Wait for an Item or short circuit
       if block: await self._ctx.not_empty.wait()
@@ -252,10 +248,12 @@ class ItemLog(Log[I]):
       # Return the head of the log
       async with self.mutex:
         if not self._ctx.not_empty.is_set(): continue # Protect against Race Conditions
-        return self.log[0]
-  
-  async def pop(self, block: bool = True) -> I | None:
-    """Pop the head of the Log (or None if non-blocking & log is empty). Caller does not need to lock the log."""
+        if mode == 'head': return self.log[0]
+        elif mode == 'tail': return self.log[-1]
+        else: raise ValueError(f"Invalid mode: {mode}")
+
+  async def pop(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> I | None:
+    """Pop the head of the Log (by default); if non-blocking & log is empty return None. Caller does not need to lock the log."""
     while True:
       # Wait for an Item or Short Circuit
       if block: await self._ctx.not_empty.wait() # Wait for an item to be pushed
@@ -263,7 +261,9 @@ class ItemLog(Log[I]):
       # Pop the head of the log
       async with self.mutex:
         if self._ctx.empty.is_set(): continue # Protect against Race Conditions
-        item = self.log.popleft()
+        if mode == 'head': item = self.log.popleft()
+        elif mode == 'tail': item = self.log.pop()
+        else: raise ValueError(f"Invalid mode: {mode}")
         self._ctx.full.clear()
         self._ctx.not_full.set()
         if len(self.log) == 0: # We popped the last item in the log
@@ -271,8 +271,8 @@ class ItemLog(Log[I]):
           self._ctx.not_empty.clear()
         return item
   
-  async def push(self, item: I, block: bool = True) -> None | I:
-    """Push an Item onto the Log at the tail (or returns the item if non-blocking & log is full). Caller does not need to lock the log."""
+  async def push(self, item: I, block: bool = True, mode: Literal['head', 'tail'] = 'tail') -> None | I:
+    """Push an Item onto the tail of the log (by default) returning the item if non-blocking & log is full. Caller does not need to lock the log."""
     while True:
       # Wait for a slot or shortcircuit
       if not block and self._ctx.full.is_set(): return item # Short Circuit
@@ -281,7 +281,9 @@ class ItemLog(Log[I]):
       # Pop the head of the log
       async with self.mutex:
         if self._ctx.full.is_set(): continue # Protect against Race Conditions
-        self.log.append(item)
+        if mode == 'tail': self.log.append(item)
+        elif mode == 'head': self.log.appendleft(item)
+        else: raise ValueError(f"Invalid mode: {mode}")
         self._ctx.not_empty.set()
         self._ctx.empty.clear()
         if self.log.maxlen is not None and len(self.log) >= self.log.maxlen: # We pushed into the last avialable slot on a bounded queue
