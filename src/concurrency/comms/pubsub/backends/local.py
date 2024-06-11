@@ -89,7 +89,9 @@ class _BrokerCtx(TypedDict):
 
 @dataclass
 class Broker(BrokerInterface):
-  """Manage State & Lifecycle of message brokering between Producers & Consumers.
+  """TODO: Update Broker Documentation
+
+Manage State & Lifecycle of message brokering between Producers & Consumers.
 
 ## Message Broker Overview
 
