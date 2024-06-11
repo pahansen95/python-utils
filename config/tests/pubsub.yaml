@@ -66,12 +66,26 @@ spec:
             #         kind: pythonModule
             #         src: concurrency/aio/watch.py
             #         dst: concurrency/aio/watch.py
-            pubsub:
-              requirements: concurrency/pubsub/requirements.txt # Path relative to the SubPackage
+            comms:
               init:
                 kind: pythonInit
-                src: concurrency/pubsub/__init__.py
-                dst: concurrency/pubsub/__init__.py
+                src: concurrency/comms/__init__.py
+                dst: concurrency/comms/__init__.py
+              pkgs:
+                pubsub:
+                  requirements: concurrency/comms/pubsub/requirements.txt
+                  init:
+                    kind: pythonInit
+                    src: concurrency/comms/pubsub/__init__.py
+                    dst: concurrency/comms/pubsub/__init__.py
+                  pkgs:
+                    backends:
+                      modules:
+                        local:
+                          module:
+                            kind: pythonModule
+                            src: concurrency/comms/pubsub/backends/local.py
+                            dst: concurrency/comms/pubsub/backends/local.py
             # gates:
             #   init:
             #     kind: pythonInit

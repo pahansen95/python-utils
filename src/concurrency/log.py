@@ -290,3 +290,95 @@ class ItemLog(Log[I]):
           self._ctx.full.set()
           self._ctx.not_full.clear()
         return None
+
+# TODO: Refactor the following to extend Item Log into a "StatefulLog"; remove
+# class _MsgLogCtx(TypedDict):
+#   """The Stateful Context of the Message Log"""
+#   events: _MsgLogCtx.Events
+#   alerts: _MsgLogCtx.Alerts
+
+#   class Events(TypedDict):
+#     empty: asyncio.Event = field(default_factory=lambda: _create_event(True))
+#     """Is the Item Log Empty"""
+#     not_empty: asyncio.Event = field(default_factory=lambda: _create_event(False))
+#     """Is the Item Log not empty"""
+#     full: asyncio.Event = field(default_factory=lambda: _create_event(False))
+#     """Is the Item Log Full"""
+#     not_full: asyncio.Event = field(default_factory=lambda: _create_event(True))
+#     """Is the Item Log not Full"""
+  
+#   class Alerts(TypedDict):
+#     push: asyncio.Queue = field(default_factory=asyncio.Queue)
+#     """An Item was pushed onto the Log, value is either 'head' or 'tail'"""
+#     pop: asyncio.Queue = field(default_factory=asyncio.Queue)
+#     """An Item was popped from the Log, value is either 'head' or 'tail'"""
+
+# @dataclass
+# class MessageLog(Log[Message[OBJ]]):
+#   """A MessageLog is an implementation of the Log Protocol based on the ItemLog Implementation"""
+
+#   log: deque[Message[OBJ]] = field(default_factory=deque)
+#   """The Item Log"""
+#   mutex: asyncio.Lock = field(default_factory=asyncio.Lock)
+#   """The Async Lock for Mutually Exclusive Access to the Log"""
+#   _ctx: _MsgLogCtx = field(default_factory=dict)
+
+#   async def wait_until(self, event: Literal['empty', 'not_empty', 'full', 'not_full']) -> Literal[True]:
+#     """Wait until an event occurs"""
+#     if event == 'full' and self.log.maxlen is None: raise ValueError('impossible to wait for an unbounded log to become full')
+#     return await self._ctx['events'][event].wait()
+  
+#   async def peek(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> Message[OBJ] | None:
+#     """Peek at the head or tail of the Message Log"""
+#     while True:
+#       # Wait for an Item or short circuit
+#       if block: await self._ctx['events']['not_empty'].wait()
+#       elif not self._ctx['events']['not_empty'].is_set(): return None # Short Circuit if non-blocking
+#       # Return the head of the log
+#       async with self.mutex:
+#         if not self._ctx['events']['not_empty'].is_set(): continue # Protect against Race Conditions
+#         if mode == 'head': return self.log[0]
+#         elif mode == 'tail': return self.log[-1]
+#         else: raise ValueError(f"Invalid mode: {mode}")
+  
+#   async def pop(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> Message[OBJ] | None:
+#     """Pop a Message from the head or tail of the Message Log; if non-blocking return None if no message is available"""
+#     while True:
+#       # Wait for an Item or Short Circuit
+#       if block: await self._ctx['events']['not_empty'].wait() # Wait for an item to be pushed
+#       elif not self._ctx['events']['not_empty'].is_set(): return None # Short Circuit if non-blocking
+#       # Pop the head of the log
+#       async with self.mutex:
+#         if self._ctx['events']['empty'].is_set(): continue # Protect against Race Conditions
+#         if mode == 'head': item = self.log.popleft()
+#         elif mode == 'tail': item = self.log.pop()
+#         else: raise ValueError(f"Invalid mode: {mode}")
+#         self._ctx['alerts']['pop'].put_nowait(mode)
+#         self._ctx['events']['full'].clear()
+#         self._ctx['events']['not_full'].set()
+#         if len(self.log) == 0: # We popped the last item in the log
+#           self._ctx['events']['empty'].set()
+#           self._ctx['events']['not_empty'].clear()
+#         return item
+
+  
+#   async def push(self, item: Message[OBJ], block: bool = True, mode: Literal['head', 'tail'] = 'tail') -> None | Message[OBJ]:
+#     """Push a Message onto the head or tail of the Message Log; if non-blocking return back the message if the log is full"""
+#     while True:
+#       # Wait for a slot or shortcircuit
+#       if not block and self._ctx['events']['full'].is_set(): return item # Short Circuit
+#       elif block and self._ctx['events']['full'].is_set(): await self._ctx['events']['not_full'].wait() # Wait until the log has a slot
+
+#       # Pop the head of the log
+#       async with self.mutex:
+#         if self._ctx['events']['full'].is_set(): continue # Protect against Race Conditions
+#         if mode == 'tail': self.log.append(item)
+#         elif mode == 'head': self.log.appendleft(item)
+#         else: raise ValueError(f"Invalid mode: {mode}")
+#         self._ctx['alerts']['push'].put_nowait(mode)
+#         self._ctx['events']['not_empty'].set()
+#         self._ctx['events']['empty'].clear()
+#         if self.log.maxlen is not None and len(self.log) >= self.log.maxlen: # We pushed into the last avialable slot on a bounded queue
+#           self._ctx['events']['full'].set()
+#           self._ctx['events']['not_full'].clear()
+#         return None

@@ -24,279 +24,32 @@ Implements basic Pub/Sub functionality
   - `subscription` Op - A Subscriber sends a `SUB` Message to a Publisher; expects a `LOG` Msg as a response
 """
 from __future__ import annotations
-from typing import TypedDict, NotRequired, TypeVar, Generic, Literal
-from collections.abc import Callable, Awaitable, Coroutine
+from typing import TypedDict, NotRequired, Literal
 from collections import deque
-from abc import abstractmethod
 from dataclasses import dataclass, field, KW_ONLY
-from utils.concurrency.log import ItemLog, Log
+from utils.concurrency.log import ItemLog
 from utils.errors import Error, NO_ERROR_T, NO_ERROR
 import orjson, asyncio, time
 from loguru import logger
-
-OBJ = TypeVar('OBJ', bound=dict)
-userdata_t = dict[str, str]
-
-class Message(Generic[OBJ], TypedDict):
-  """A Datastructure representing an `inflight` payload."""
-  metadata: Message.Metadata
-  """Metadata associated w/ a Message"""
-  payload: OBJ
-  """A JSON Encodable dict of arbitrary content"""
-  class Metadata(TypedDict):
-    name: str
-    """A Unique Identifier for the Message"""
-    channel: str
-    """A Unique Identifier for the Channel ID this Message Belongs to"""
-    sender: NotRequired[str]
-    """A Unique Identifier identifying who originally published this message"""
-    recipient: NotRequired[str]
-    """A Unique Identifier identifying what subscriber this message is destined to"""
-    timestamp: int
-    """The chronological timestamp when this message was published; the formating is backend dependant"""
-    userdata: NotRequired[userdata_t]
-    """Arbitrary Key-Value Metadata"""
-  
-  @staticmethod
-  def factory(
-    payload: OBJ,
-    userdata: dict[str, str],
-    **kwargs
-  ) -> Message[OBJ]:
-    now = time.monotonic_ns()
-    metadata = { 'name': f"msg-{now:x}", 'timestamp': now, 'userdata': userdata } | kwargs
-    return { 'metadata': metadata, 'payload': payload }
-  
-  @staticmethod
-  def marshal(msg: Message[OBJ], opts: int = orjson.OPT_APPEND_NEWLINE) -> bytes:
-    return orjson.dumps(
-      { 'metadata': msg['metadata'], 'payload': orjson.Fragment(msg['payload']) },
-      option=opts
-    )
-
-  @staticmethod
-  def unmarshal(data: bytes) -> Message[OBJ]:
-    return orjson.loads(data)
-
-msglog_t = ItemLog[Message[OBJ]]
-"""TypeHint: A Log of Messages"""
-unpacked_msg_t = tuple[OBJ, userdata_t]
-"""TypeHint: An Unpacked Message Object"""
-rxq_t = Callable[[str, str], Awaitable[tuple[Error | NO_ERROR_T, unpacked_msg_t | None]]]
-"""A Receiver Queue Async Interface: A Factory function that given (client ID, channel ID) returns an Awaitable producing a new message or any errors encountered"""
-txq_t = Callable[[str, str, OBJ, userdata_t], Awaitable[Error | NO_ERROR_T]]
-"""A Transmitter Queue Async Interface: A factory function that given (client ID, channel ID, Payload, Userdata) returns an Awaitable, which upon completion garuntees the message was transmitted or an error was encountered."""
+from .. import (
+  BrokerInterface, ConsumerInterface, ProducerInterface,
+  CongestionConfig, Message, ChannelRegistry,
+  generate_id, _raise_TODO,
+  OBJ, userdata_t, unpacked_msg_t, msg_push_t, msg_filter_t
+)
 
 def _create_event(state: bool) -> asyncio.Event:
   event = asyncio.Event()
   if state: event.set()
   return event
 
-class _MsgLogCtx(TypedDict):
-  """The Stateful Context of the Message Log"""
-  events: _MsgLogCtx.Events
-  alerts: _MsgLogCtx.Alerts
-
-  class Events(TypedDict):
-    empty: asyncio.Event = field(default_factory=lambda: _create_event(True))
-    """Is the Item Log Empty"""
-    not_empty: asyncio.Event = field(default_factory=lambda: _create_event(False))
-    """Is the Item Log not empty"""
-    full: asyncio.Event = field(default_factory=lambda: _create_event(False))
-    """Is the Item Log Full"""
-    not_full: asyncio.Event = field(default_factory=lambda: _create_event(True))
-    """Is the Item Log not Full"""
-  
-  class Alerts(TypedDict):
-    push: asyncio.Queue = field(default_factory=asyncio.Queue)
-    """An Item was pushed onto the Log, value is either 'head' or 'tail'"""
-    pop: asyncio.Queue = field(default_factory=asyncio.Queue)
-    """An Item was popped from the Log, value is either 'head' or 'tail'"""
-
-
-# @dataclass
-# class MessageLog(Log[Message[OBJ]]):
-#   """A MessageLog is an implementation of the Log Protocol based on the ItemLog Implementation"""
-
-#   log: deque[Message[OBJ]] = field(default_factory=deque)
-#   """The Item Log"""
-#   mutex: asyncio.Lock = field(default_factory=asyncio.Lock)
-#   """The Async Lock for Mutually Exclusive Access to the Log"""
-#   _ctx: _MsgLogCtx = field(default_factory=dict)
-
-#   async def wait_until(self, event: Literal['empty', 'not_empty', 'full', 'not_full']) -> Literal[True]:
-#     """Wait until an event occurs"""
-#     if event == 'full' and self.log.maxlen is None: raise ValueError('impossible to wait for an unbounded log to become full')
-#     return await self._ctx['events'][event].wait()
-  
-#   async def peek(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> Message[OBJ] | None:
-#     """Peek at the head or tail of the Message Log"""
-#     while True:
-#       # Wait for an Item or short circuit
-#       if block: await self._ctx['events']['not_empty'].wait()
-#       elif not self._ctx['events']['not_empty'].is_set(): return None # Short Circuit if non-blocking
-#       # Return the head of the log
-#       async with self.mutex:
-#         if not self._ctx['events']['not_empty'].is_set(): continue # Protect against Race Conditions
-#         if mode == 'head': return self.log[0]
-#         elif mode == 'tail': return self.log[-1]
-#         else: raise ValueError(f"Invalid mode: {mode}")
-  
-#   async def pop(self, block: bool = True, mode: Literal['head', 'tail'] = 'head') -> Message[OBJ] | None:
-#     """Pop a Message from the head or tail of the Message Log; if non-blocking return None if no message is available"""
-#     while True:
-#       # Wait for an Item or Short Circuit
-#       if block: await self._ctx['events']['not_empty'].wait() # Wait for an item to be pushed
-#       elif not self._ctx['events']['not_empty'].is_set(): return None # Short Circuit if non-blocking
-#       # Pop the head of the log
-#       async with self.mutex:
-#         if self._ctx['events']['empty'].is_set(): continue # Protect against Race Conditions
-#         if mode == 'head': item = self.log.popleft()
-#         elif mode == 'tail': item = self.log.pop()
-#         else: raise ValueError(f"Invalid mode: {mode}")
-#         self._ctx['alerts']['pop'].put_nowait(mode)
-#         self._ctx['events']['full'].clear()
-#         self._ctx['events']['not_full'].set()
-#         if len(self.log) == 0: # We popped the last item in the log
-#           self._ctx['events']['empty'].set()
-#           self._ctx['events']['not_empty'].clear()
-#         return item
-
-  
-#   async def push(self, item: Message[OBJ], block: bool = True, mode: Literal['head', 'tail'] = 'tail') -> None | Message[OBJ]:
-#     """Push a Message onto the head or tail of the Message Log; if non-blocking return back the message if the log is full"""
-#     while True:
-#       # Wait for a slot or shortcircuit
-#       if not block and self._ctx['events']['full'].is_set(): return item # Short Circuit
-#       elif block and self._ctx['events']['full'].is_set(): await self._ctx['events']['not_full'].wait() # Wait until the log has a slot
-
-#       # Pop the head of the log
-#       async with self.mutex:
-#         if self._ctx['events']['full'].is_set(): continue # Protect against Race Conditions
-#         if mode == 'tail': self.log.append(item)
-#         elif mode == 'head': self.log.appendleft(item)
-#         else: raise ValueError(f"Invalid mode: {mode}")
-#         self._ctx['alerts']['push'].put_nowait(mode)
-#         self._ctx['events']['not_empty'].set()
-#         self._ctx['events']['empty'].clear()
-#         if self.log.maxlen is not None and len(self.log) >= self.log.maxlen: # We pushed into the last avialable slot on a bounded queue
-#           self._ctx['events']['full'].set()
-#           self._ctx['events']['not_full'].clear()
-#         return None
-
-@dataclass
-class ChannelRegistry:
-  messages: dict[str, Message] = field(default_factory=dict)
-  """All currently recorded Messages in the Registry"""
-  channels: dict[str, ItemLog[Message[OBJ]]] = field(default_factory=dict)
-  """The known set of Channels & their current Log of Messages"""
-  publishments: dict[str, set[str]] = field(default_factory=dict)
-  """Publishers associated with a channel: { channel_id: set(publisher_id, ...) }"""
-  subscriptions: dict[str, set[str]] = field(default_factory=dict)
-  """Subscribers associated with a channel: { channel_id: set(subscriber_id, ...) }"""
-
-  def add_channel(self, channel_id: str):
-    """Add a Channel to the Registry"""
-    if channel_id in self.channels: raise ValueError(channel_id)
-    self.channels[channel_id] = ItemLog()
-    self.subscriptions[channel_id] = set()
-    self.publishments[channel_id] = set()
-  
-  def remove_channel(self, channel_id: str):
-    """Remove a Channel from the Registry"""
-    if channel_id not in self.channels: raise ValueError(channel_id)
-    msg_log = self.channels.pop(channel_id)
-    for msg_id in msg_log:
-      del self.messages[msg_id]
-    del self.subscriptions[channel_id]
-    del self.publishments[channel_id]
-  
-  def add_publisher(self, channel_id: str, client_id: str):
-    """Add a publisher mapping to a Channel in the Registry"""
-    if channel_id not in self.channels: raise ValueError(channel_id)
-    self.publishments[channel_id].add(client_id)
-  
-  def remove_publisher(self, channel_id: str, client_id: str):
-    """Remove a publisher mapping from a Channel in the Registry"""
-    if channel_id not in self.channels: raise ValueError(channel_id)
-    self.publishments[channel_id].remove(client_id)
-  
-  def add_subscriber(self, channel_id: str, client_id: str):
-    """Add a subscriber mapping to a Channel in the Registry"""
-    if channel_id not in self.channels: raise ValueError(channel_id)
-    self.subscriptions[channel_id].add(client_id)
-  
-  def remove_subscriber(self, channel_id: str, client_id: str):
-    """Remove a subscriber mapping from a Channel in the Registry"""
-    if channel_id not in self.channels: raise ValueError(channel_id)
-    self.subscriptions[channel_id].remove(client_id)
-  
-  async def add_message(self, msg: Message) -> Error | NO_ERROR_T:
-    """Add a Message in the Registry adding it to the proper Channel Log."""
-    if msg['metadata']['name'] in self.messages: return { 'kind': 'conflict', 'msg': f'{msg["metadata"]["name"]} already recorded' }
-    channel_id = msg['metadata']['channel']
-    if channel_id not in self.channels: return { 'kind': 'missing', 'msg': f'{channel_id} not registered' }
-    if msg['metadata']['sender'] not in self.publishments[channel_id]: return { 'kind': 'missing', 'msg': f'{msg["metadata"]["sender"]} is not a publisher of {channel_id}' }
-    self.messages[msg['metadata']['name']] = msg
-    await self.channels[channel_id].push(msg) # TODO: Should we refactor MessageLogs to use just the IDs instead of the full message? 
-    return NO_ERROR
-
-  async def remove_message(self, msg_id: str) -> Error | NO_ERROR_T:
-    """Remove a Message from the Registry scrubbing it from it's channel log"""
-    if msg_id not in self.messages: return { 'kind': 'missing', 'msg': f'{msg_id} not recorded' }
-    msg = self.messages[msg_id]
-    channel_id = msg['metadata']['channel']
-    if channel_id in self.channels:
-      raise NotImplementedError # TODO: Remove the message from the channel log
-
-# @dataclass
-# class OLD_ChannelRegistry:
-#   channels: dict[str, msglog_t] = field(default_factory=dict)
-#   """The known set of Channels & their current Log of Messages"""
-#   publishments: dict[str, set[str]]
-#   """Publishers associated with a channel: { channel_id: set(publisher_id, ...) }"""
-#   subscriptions: dict[str, set[str]]
-#   """Subscribers associated with a channel: { channel_id: set(subscriber_id, ...) }"""
-
-#   def register(self, channel_id: str, log: msglog_t | None = None):
-#     if channel_id in self.channels: return { 'kind': 'conflict', 'msg': f'{channel_id} already registered' }
-#     self.channels[channel_id] = log or ItemLog()
-#     self.subscriptions[channel_id] = set()
-#     self.publishments[channel_id] = set()
-  
-#   def deregister(self, channel_id: str) -> msglog_t:
-#     if channel_id not in self.channels: return { 'kind': 'missing', 'msg': f'{channel_id} not registered' }
-#     del self.subscriptions[channel_id]
-#     del self.publishments[channel_id]
-#     return self.channels.pop(channel_id)
-  
-#   def add_publishment(self, channel_id: str, pub_id: str):
-#     if channel_id not in self.channels: raise ValueError(channel_id)
-#     self.publishments[channel_id].add(pub_id)
-  
-#   def remove_publishment(self, channel_id: str, pub_id: str):
-#     if channel_id not in self.channels: raise ValueError(channel_id)
-#     self.publishments[channel_id].remove(pub_id)
-  
-#   def add_subscription(self, channel_id: str, sub_id: str):
-#     if channel_id not in self.channels: raise ValueError(channel_id)
-#     self.subscriptions[channel_id].add(sub_id)
-  
-#   def remove_subscription(self, channel_id: str, sub_id: str):
-#     if channel_id not in self.channels: raise ValueError(channel_id)
-#     self.subscriptions[channel_id].remove(sub_id)
-
-class CongestionConfig(TypedDict):
-  mode: Literal['buffer', 'drop']
-  """The mode of congestion handling"""
-  opts: NotRequired[BufferOpts]
-  """Mode Specific Configuration Options"""
-
-  class BufferOpts(TypedDict):
-    limit: NotRequired[int]
-    """The maximum number of messages to buffer before dropping messages; if omitted, the buffer is unbounded."""
-    direction: NotRequired[Literal['head', 'tail']]
-    """The direction to drop messages from when a bounded buffer is full; defaults to 'head' if omitted."""
+class _MsgRetention(TypedDict):
+  done: asyncio.Event
+  """Was the message processed by the Broker?"""
+  result: NotRequired[Literal['retained', 'rejected']]
+  """Did the Broker retain or reject the message? Not expected until `done` is set"""
+  err: NotRequired[Error]
+  """If the message was rejected, what was the error? Not expected unless `result` is 'rejected'"""
 
 class _PubState(TypedDict):
   rx_queue: ItemLog[Message[OBJ]]
@@ -309,9 +62,9 @@ class _SubState(TypedDict):
   """The Message Delivery Queue for the subscribing client"""
   tx_queue: ItemLog[str]
   """The Message Transmission Queue for the subscribing client"""
-  listener: Callable[..., Coroutine[Error | NO_ERROR_T, None, None]]
-  """The client's listener used to push messages to the client; should return an error if the message fails to deliver or would block indefinitely."""
-  filters: dict[str, Callable[..., bool]]
+  client_rx: msg_push_t
+  """The client's Rx Interface used to push messages to the client; should return an error if the message fails to deliver or would block indefinitely."""
+  filters: dict[str, msg_filter_t]
   """The optional per channel filters for the subscriber"""
   disconnect: asyncio.Event
   """Tracks if the Client has disconnected"""
@@ -335,7 +88,7 @@ class _BrokerCtx(TypedDict):
     } | kwargs
 
 @dataclass
-class Broker:
+class Broker(BrokerInterface):
   """Manage State & Lifecycle of message brokering between Producers & Consumers.
 
 ## Message Broker Overview
@@ -388,7 +141,7 @@ When a consumer unsubscribes from a channel:
 - **Inactive Status**: If unsubscribed from all channels, the consumer is considered "inactive" and does not participate in message multicasting.
   """
 
-  id: str = field(default_factory=lambda: f"broker-{time.monotonic_ns():x}")
+  _id: str = field(default_factory=lambda: generate_id('broker'))
   """The Unique Identity of a Broker"""
   channel_registry: ChannelRegistry = field(default_factory=ChannelRegistry)
   """The current state of channels"""
@@ -396,7 +149,10 @@ When a consumer unsubscribes from a channel:
   _ctx: _BrokerCtx = field(default_factory=_BrokerCtx.factory)
   """Stateful Context of the Broker"""
 
-  async def _setup_producer(self, client_id: str) -> Callable[[Message[OBJ]], Coroutine[None, None, Error | NO_ERROR_T]]:
+  @property
+  def id(self) -> str: return self._id
+
+  async def _setup_producer(self, client_id: str) -> msg_push_t:
 
     # Setup Broker Multicasting Loop on the first publisher
     task_key = f"loop_multicast"
@@ -408,7 +164,9 @@ When a consumer unsubscribes from a channel:
         )
       )
 
-    if client_id in self._ctx['producers']: raise NotImplementedError('Client Connection Refresh')
+    if client_id in self._ctx['producers']:
+      ... # TODO: Implement Client Connection Refresh
+      _raise_TODO('Client Connection Refresh')
     self._ctx['producers'][client_id] = {
       'rx_queue': ItemLog(),
       'disconnect': asyncio.Event(),
@@ -417,7 +175,8 @@ When a consumer unsubscribes from a channel:
     # Schedule the client Rx Loop
     task_key = f"loop_{client_id}_rx"
     if task_key in self._ctx['tasks']:
-      raise NotImplementedError # TODO Cancel the Current Task
+      ... # TODO Cancel the Current Task
+      _raise_TODO('Client Connection Refresh')
     self._ctx['tasks'][task_key] = asyncio.create_task(
       self._loop_rx(
         client_id=client_id,
@@ -429,7 +188,8 @@ When a consumer unsubscribes from a channel:
     # Schedule the shared client disconnect wait task
     task_key = f"wait_{client_id}_disconnect"
     if task_key in self._ctx['tasks']:
-      raise NotImplementedError # TODO Cancel the Current Task
+      ... # TODO Cancel the Current Task
+      _raise_TODO('Cancel the current disconnect task')
     self._ctx['tasks'][task_key] = asyncio.create_task(self._ctx['producers'][client_id]['disconnect'].wait())
 
     return self._publish_message_coro_factory(
@@ -439,8 +199,12 @@ When a consumer unsubscribes from a channel:
   
   async def _teardown_producer(self, client_id: str):
     if client_id not in self._ctx['producers']: raise ValueError(f'{client_id} was never connected')
-    if client_id in self.channel_registry.publishments:
-      raise NotImplementedError # TODO: Revoke all channel publishments
+    logger.trace(f"Removing Client {client_id} from all Publishments")
+    for channel_id in [
+      channel_id
+      for channel_id, publishers in self.channel_registry.publishments.items()
+      if client_id in publishers
+    ]: self._remove_channel_publisher(client_id, channel_id)
     logger.trace(f"Marking Client {client_id} as Disconnected")
     self._ctx['producers'][client_id]['disconnect'].set()
     logger.trace(f"Cancelling Client {client_id} loops")
@@ -473,14 +237,14 @@ When a consumer unsubscribes from a channel:
   
   async def _setup_consumer(self,
     client_id: str,
-    listener: Callable[..., Coroutine],
+    client_rx: msg_push_t,
     congestion_cfg: CongestionConfig,
   ):
     if client_id in self._ctx['consumers']: raise NotImplementedError('Client Connection Refresh')
     self._ctx['consumers'][client_id] = {
       'delivery_queue': ItemLog(),
       'tx_queue': ItemLog(),
-      'listener': listener,
+      'client_rx': client_rx,
       'disconnect': asyncio.Event(),
       'filters': {},
     }
@@ -488,7 +252,8 @@ When a consumer unsubscribes from a channel:
     # Schedule client Delivery Eval Loop
     task_key = f"loop_{client_id}_delivery_eval"
     if task_key in self._ctx['tasks']:
-      raise NotImplementedError # TODO Cancel the Current Task
+      _raise_TODO('Cancel the current task')
+      ... # TODO Cancel the Current Task
     self._ctx['tasks'][task_key] = asyncio.create_task(
       self._loop_delivery_eval(
         client_id=client_id,
@@ -500,11 +265,12 @@ When a consumer unsubscribes from a channel:
     # Schedule client TX Loop
     task_key = f"loop_{client_id}_tx"
     if task_key in self._ctx['tasks']:
-      raise NotImplementedError # TODO Cancel the Current Task
+      _raise_TODO('Cancel the current task')
+      ... # TODO Cancel the Current Task
     self._ctx['tasks'][task_key] = asyncio.create_task(
       self._loop_tx(
         client_id=client_id,
-        listener=self._ctx['consumers'][client_id]['listener'],
+        client_rx=self._ctx['consumers'][client_id]['client_rx'],
         tx_queue=self._ctx['consumers'][client_id]['tx_queue'],
         cfg=congestion_cfg,
       )
@@ -513,13 +279,17 @@ When a consumer unsubscribes from a channel:
     # Schedule the shared client disconnect wait task
     task_key = f"wait_{client_id}_disconnect"
     if task_key in self._ctx['tasks']:
-      raise NotImplementedError # TODO Cancel the Current Task
+      _raise_TODO('Cancel the current task')
+      ... # TODO Cancel the Current Task
     self._ctx['tasks'][task_key] = asyncio.create_task(self._ctx['consumers'][client_id]['disconnect'].wait())
 
   async def _teardown_consumer(self, client_id: str):
     if client_id not in self._ctx['consumers']: raise ValueError(f'{client_id} was never connected')
-    if client_id in self.channel_registry.subscriptions:
-      raise NotImplementedError # TODO: Unsubscribe from all channels
+    for channel_id in list(
+      channel_id
+      for channel_id, subscribers in self.channel_registry.subscriptions.items()
+      if client_id in subscribers
+    ): self._remove_channel_subscriber(client_id, channel_id)
     logger.trace(f"Marking Client {client_id} as Disconnected")
     self._ctx['consumers'][client_id]['disconnect'].set()
     logger.trace(f"Cancelling Client {client_id} loops")
@@ -542,24 +312,33 @@ When a consumer unsubscribes from a channel:
 
   def _add_channel_publisher(self, client_id: str, channel_id: str):
     if not channel_id in self.channel_registry.channels: self.channel_registry.add_channel(channel_id)    
-    if client_id not in self.channel_registry.publishments: self.channel_registry.add_publisher(channel_id, client_id)
+    if client_id not in self.channel_registry.publishments[channel_id]: self.channel_registry.add_publisher(channel_id, client_id)
   
   def _remove_channel_publisher(self, client_id: str, channel_id: str):
     if not channel_id in self.channel_registry.channels: raise ValueError(f'{channel_id} was never registered')
-    if client_id in self.channel_registry.publishments: self.channel_registry.remove_publisher(channel_id, client_id)
+    if client_id in self.channel_registry.publishments[channel_id]: self.channel_registry.remove_publisher(channel_id, client_id)
     if len(self.channel_registry.publishments[channel_id]) == 0: self.channel_registry.remove_channel(channel_id)
 
-  def _publish_message_coro_factory(self, client_id: str, rx_queue: msglog_t) -> Callable[[Message[OBJ]], Coroutine[None, None, Error | NO_ERROR_T]]:
+  def _publish_message_coro_factory(self, client_id: str, rx_queue: ItemLog[tuple[Message[OBJ], _MsgRetention]]) -> msg_push_t:
     offline_err = { 'kind': 'offline', 'message': f"Client `{client_id}` is offline" }
     wait_for_disconnect: asyncio.Task = self._ctx['tasks'][f"wait_{client_id}_disconnect"]
+    async def push_and_process_message(msg: Message[OBJ], retention: _MsgRetention):
+      logger.trace(f'Pushing Message into the Rx Queue for Client {client_id}')
+      await rx_queue.push((msg, retention))
+      logger.trace(f'Waiting for Broker to process the Message for Client {client_id}')
+      await retention['done'].wait()
+      logger.trace(f'Broker has processed the Message for Client {client_id}')
     async def publish_message(msg: Message[OBJ]) -> Error | NO_ERROR_T:
       logger.trace(f'Publishing Message for Client {client_id}')
       if client_id not in self._ctx['producers']: return offline_err
+      retention = { 'done': _create_event(False) }
+      msg_id = msg['metadata']['id']
       channel_id = msg['metadata']['channel']
       if channel_id not in self.channel_registry.channels: return { 'kind': 'missing', 'message': f"Channel `{channel_id}` is not registered" }
       elif client_id not in self.channel_registry.publishments[channel_id]: return { 'kind': 'missing', 'message': f"Client `{client_id}` did not announce it's publishment to `{channel_id}`" }
       logger.trace(f'Scheduling Task to push message into the Rx Queue for Client {client_id}')
-      push_task = asyncio.create_task(rx_queue.push(msg))
+      # push_task = asyncio.create_task(rx_queue.push((msg, retained)))
+      push_task = asyncio.create_task(push_and_process_message(msg, retention))
       logger.trace(f'Waiting for either the message to be pushed or Client {client_id} to disconnect')
       await asyncio.wait((
         push_task,
@@ -570,30 +349,36 @@ When a consumer unsubscribes from a channel:
         push_task.cancel()
         return offline_err
       assert push_task.done()
-      logger.trace(f'Pushed Message into the Rx Queue for Client {client_id}')
-      return NO_ERROR
+      if retention['result'] == 'retained':
+        logger.trace(f'Broker {self.id} has taken posession of Message {msg_id} from Client {client_id}')
+        return NO_ERROR
+      elif retention['result'] == 'rejected':
+        return retention['err']
+      else: raise RuntimeError(f'Unexpected Message Retention State: {retention["result"]}')
     
     logger.trace(f'Created Publish Message Coroutine Factory for Client {client_id}')
     return publish_message
   
   def _add_channel_subscriber(self,
-    client_id: str, channel_id: str,
-    msg_filter: Callable[..., bool] | None,
+    client_id: str,
+    channel_id: str,
+    msg_filter: msg_filter_t | None,
   ):
     """Setup a Client's Channel Subscription"""
     if not channel_id in self.channel_registry.channels: raise ValueError(f'{channel_id} must first be registered for publishment before it can be subscribed to')
-    if client_id not in self.channel_registry.subscriptions: self.channel_registry.add_subscriber(channel_id, client_id)
+    if client_id not in self.channel_registry.subscriptions[channel_id]: self.channel_registry.add_subscriber(channel_id, client_id)
     if msg_filter is not None: self._ctx['consumers'][client_id]['filters'][channel_id] = msg_filter
 
   def _remove_channel_subscriber(self, client_id: str, channel_id: str):
     if not channel_id in self.channel_registry.channels: raise ValueError(f'{channel_id} was never registered')
-    if client_id in self.channel_registry.subscriptions: self.channel_registry.remove_subscriber(channel_id, client_id)
+    if client_id in self.channel_registry.subscriptions[channel_id]: self.channel_registry.remove_subscriber(channel_id, client_id)
+    if channel_id in self._ctx['consumers'][client_id]['filters']: del self._ctx['consumers'][client_id]['filters'][channel_id]
 
   ### Broker Loops ###
 
   async def _loop_rx(self,
     client_id: str,
-    rx_queue: msglog_t,
+    rx_queue: ItemLog[tuple[Message[OBJ], _MsgRetention]],
     multicast_queue: ItemLog[str],
   ):
     """Recieve messages from a publishing source, record them & then forward them to the multicast loop for distribution."""
@@ -605,18 +390,27 @@ When a consumer unsubscribes from a channel:
         pop = False
 
       if self._ctx['producers'][client_id]['disconnect'].is_set():
-        raise NotImplementedError('Client Disconnected')
+        _raise_TODO('Client Disconnected')
 
       logger.trace(f"Peeking at the Rx Queue for Client {client_id}")
-      msg, pop = (await rx_queue.peek(), True)
-      channel_id = msg['metadata']['channel']
-      assert client_id == msg['metadata']['sender']
+      (msg, retention), pop = (await rx_queue.peek(), True)
+      # channel_id = msg['metadata']['channel']
+      # assert client_id == msg['metadata']['sender']
 
       logger.trace(f"Adding Message to the Channel Registry for Client {client_id}")
       err = await self.channel_registry.add_message(msg)
       if err is not NO_ERROR:
-        raise NotImplementedError(f"{err['kind']}: {err['msg']}")
-      else: await multicast_queue.push(msg['metadata']['name'])
+        # logger.critical(f"Failed to add Message {msg['metadata']['id']} to the Channel Registry for Client {client_id}: {err['kind']}: {err['msg']}")
+        retention['result'] = 'rejected'
+        retention['err'] = err
+      else:
+        retention['result'] = 'retained'
+      logger.trace(f"Broker {self.id} has processed Message {msg['metadata']['id']} from Client {client_id}")
+      retention['done'].set() # Inform the Cooperative Publishing Function the broker has processed the message
+      
+      if retention['result'] == 'retained':
+        logger.trace(f"Pushing Message {msg['metadata']['id']} into the Broker's Multicast Queue")
+        await multicast_queue.push(msg['metadata']['id'])
 
   async def _loop_multicast(
     self,
@@ -666,28 +460,28 @@ When a consumer unsubscribes from a channel:
       ### State Checks ###
       logger.trace(f"Evaluating Message {msg_id} for Delivery to Client {client_id}")
       if channel_id not in self.channel_registry.channels:
-        raise NotImplementedError # Not a valid channel
+        _raise_TODO('Not a Valid Channel') # Not a valid channel
       elif client_id not in self.channel_registry.subscriptions[channel_id]:
-        raise NotImplementedError # Client isn't subscribed to this channel
+        _raise_TODO('Client not subscribed to this channel') # Client isn't subscribed to this channel
       elif self._ctx['consumers'][client_id]['disconnect'].is_set():
-        raise NotImplementedError # Client is currently disconnected
+        _raise_TODO('Client is disconnected') # Client is currently disconnected
       elif msg_filter is not None and not msg_filter(
         channel_id,
         self.channel_registry.messages[msg_id]['payload'],
         self.channel_registry.messages[msg_id]['metadata'].get('userdata', {})
       ):
-        raise NotImplementedError # Client filtered out the message
+        _raise_TODO('Client filtered out the message') # Client filtered out the message
       else:
         logger.trace(f"Pushing Message {msg_id} to the Tx Queue for Client {client_id}")
         await tx_queue.push(msg_id) # The Message is valid; handoff to the Tx Queue
 
   async def _loop_tx(self,
     client_id: str,
-    listener: Callable[[Message[OBJ]], Coroutine[None, None, Error | NO_ERROR_T]],
+    client_rx: msg_push_t,
     tx_queue: ItemLog[str],
     cfg: CongestionConfig,
   ):
-    """Transmit the Message to the Client via the provided listener"""
+    """Transmit the Message to the Client via the provided client_rx"""
 
     async def _tx_message(msg_id: str) -> Error | NO_ERROR_T:
       logger.trace(f"Retrieving Message {msg_id} from the Channel Registry")
@@ -699,7 +493,7 @@ When a consumer unsubscribes from a channel:
         'payload': msg['payload']
       }
       logger.trace(f"Transmitting Message {msg_id} to Client {client_id}")
-      return await listener(tx_msg)
+      return await client_rx(tx_msg)
 
     congestion_mode = cfg['mode']
     buffer_limit = cfg.get('opts', {}).get('limit')
@@ -727,7 +521,7 @@ When a consumer unsubscribes from a channel:
             still_congested = err['still_congested'] # TODO: Implement
             mode = 'congested'
             buffer.append(msg_id)
-          else: raise NotImplementedError(err['kind'])
+          else: _raise_TODO(f'Handle Error for Client {client_id}: {err["kind"]}: {err["message"]}')
       elif mode == 'congested':
         ### While in Congested Mode, we either buffer or drop messages
         if not still_congested.is_set():
@@ -743,7 +537,7 @@ When a consumer unsubscribes from a channel:
             else: raise ValueError(buffer_pop_from)
           buffer.append(msg_id)
         elif congestion_mode == 'drop':
-          raise NotImplementedError # Drop the messae
+          _raise_TODO('Drop the message') # TODO: Implement
         else: raise ValueError(congestion_mode)
       elif mode == 'drain':
         ### While in Drain Mode, we attempt to first deliver all messages in the buffer ###
@@ -763,7 +557,7 @@ When a consumer unsubscribes from a channel:
       
   ### Client Interface ###
 
-  async def connect_producer(self, client_id: str) -> tuple[Error | NO_ERROR_T, Callable[[Message[OBJ]], Coroutine[None, None, Error | NO_ERROR_T]] | None]:
+  async def connect_producer(self, client_id: str) -> tuple[Error | NO_ERROR_T, msg_push_t | None]:
     """Asynchronously connects a Producer Client to the Broker
     Returns a Coroutine Factory the publisher may use to push a message into the Broker.
     """
@@ -775,7 +569,7 @@ When a consumer unsubscribes from a channel:
   
   async def connect_consumer(self,
     client_id: str,
-    consumer_rx: Callable[[Message[OBJ]], Coroutine[None, None, Error | NO_ERROR_T]],
+    consumer_rx: msg_push_t,
     congestion_cfg: CongestionConfig = None
   ) -> Error | NO_ERROR_T:
     """Asynchronously connects a Conumer Client to the Broker.
@@ -822,7 +616,7 @@ When a consumer unsubscribes from a channel:
 
     return NO_ERROR
   
-  def add_subscription(self, client_id: str, channel_id: str, msg_filter: Callable[[str, OBJ, dict[str, str]], bool] = None) -> Error | NO_ERROR_T:
+  def add_subscription(self, client_id: str, channel_id: str, msg_filter: msg_filter_t = None) -> Error | NO_ERROR_T:
     """Sets up a new client subscription to a channel.
     The caller may optionally provide a message filtering function that is evaluated during delivery evaluation.
     """
@@ -848,7 +642,7 @@ class _ProducerCtx(TypedDict):
   """Stateful Context of the Producer"""
   broker: NotRequired[Broker]
   """The currently subscribed Broker"""
-  publish: NotRequired[txq_t]
+  publish: NotRequired[...]
   """The Publish Async Interface"""
 
   @staticmethod
@@ -856,30 +650,40 @@ class _ProducerCtx(TypedDict):
     return {} | { k: v for k, v in kwargs.items if k in ['broker', 'txq'] }
 
 @dataclass
-class Producer:
+class Producer(ProducerInterface):
   """A Produce publishes messages on a Broker"""
 
   _: KW_ONLY
-  id: str = field(default_factory=lambda: f"producer-{time.monotonic_ns():x}")
+  _id: str = field(default_factory=lambda: generate_id('producer'))
   """The Unique Identity of a Broker"""
   _ctx: _ProducerCtx = field(default_factory=dict)
   """Current State of the Producer"""
 
-  def connect(self, broker: Broker) -> Error | NO_ERROR_T:
+  @property
+  def id(self) -> str: return self._id
+
+  async def connect(self, broker: Broker) -> Error | NO_ERROR_T:
     """Connects, or refreshes the connection, to a Broker"""
     if 'broker' in self._ctx and self._ctx['broker'] is not broker: return { 'kind': 'conflict', 'message': f"Producer `{self.id}` is already connected to a different Broker" }
-    err, publish = broker.connect_producer(self.id)
+    err, publish = await broker.connect_producer(self.id)
     if err is not NO_ERROR:
       return err
     self._ctx['broker'] = broker
     self._ctx['publish'] = publish
     return NO_ERROR
 
+  async def disconnect(self) -> Error | NO_ERROR_T:
+    if 'broker' not in self._ctx: return { 'kind': 'missing', 'message': f"Producer `{self.id}` is not connected to a Broker" }
+    err = await self._ctx['broker'].disconnect(self.id)
+    del self._ctx['broker']
+    del self._ctx['publish']
+    return err
+
   def announce(self, channel_id: str) -> Error | NO_ERROR_T:
     """Inform the Broker of the producer's intent to publish messages on a channel"""
     if 'broker' not in self._ctx: raise RuntimeError(f"Producer `{self.id}` is not connected to a Broker")
     return self._ctx['broker'].announce_publisher(self.id, channel_id)
-  
+    
   def revoke(self, channel_id: str) -> Error | NO_ERROR_T:
     """Revokes a previous announcement of the producer's intent to publish messages on a channel."""
     if 'broker' not in self._ctx: raise RuntimeError(f"Producer `{self.id}` is not connected to a Broker")
@@ -909,51 +713,51 @@ class _ConsumerCtx(TypedDict):
   """The Congestion State of the Consumer"""
 
 @dataclass
-class Consumer:
+class Consumer(ConsumerInterface):
   """A Consumer subscribes to messages from a Broker"""
 
   _: KW_ONLY
-  id: str = field(default_factory=lambda: f"consumer-{time.monotonic_ns():x}")
+  _id: str = field(default_factory=lambda: generate_id('consumer'))
   """The Unique Identity of a Broker"""
   _ctx: _ConsumerCtx = field(default_factory=dict)
   """Current State of the Producer"""
+
 
   async def _rx(self, msg: Message[OBJ]) -> Error | NO_ERROR_T:
     """The Consumer's Async Rx Interface"""
     if 'broker' not in self._ctx: raise RuntimeError(f"Consumer `{self.id}` is not connected to a Broker")
     channel_id = msg['metadata']['channel']
-    if channel_id not in self._ctx['subscriptions']: return { 'kind': 'missing', 'message': f"Consumer `{self.id}` is not subscribed to channel `{channel_id}`" }
+    if channel_id not in self._ctx['buffer']: return { 'kind': 'missing', 'message': f"Consumer `{self.id}` is not subscribed to channel `{channel_id}`" }
     msg = await self._ctx['rx'].push(msg, block=False)
     if msg is None: return NO_ERROR
     else:
       self._ctx['is_congested'] = _create_event(True)
       return { 'kind': 'congested', 'message': f"Consumer `{self.id}`'s message log is full", 'still_congested': self._ctx['is_congested'] }
 
-  def connect(self, broker: Broker, congestion_cfg: CongestionConfig = None) -> Error | NO_ERROR_T:
+  async def connect(self, broker: Broker, congestion_cfg: CongestionConfig = None) -> Error | NO_ERROR_T:
     """Connects, or refreshes the connection, to a Broker"""
     if 'broker' in self._ctx and self._ctx['broker'] is not broker: return { 'kind': 'conflict', 'message': f"Consumer `{self.id}` is already connected to a different Broker" }
-    if congestion_cfg: err = broker.connect_consumer(self.id, self.listen, congestion_cfg)
-    else: err = broker.connect_consumer(self.id, self.listen)
+    if congestion_cfg: err = await broker.connect_consumer(self.id, self._rx, congestion_cfg)
+    else: err = await broker.connect_consumer(self.id, self._rx)
     if err is not NO_ERROR: return err
     # Initialize the Consumer State
     self._ctx['broker'] = broker
     self._ctx['rx'] = ItemLog()
-    self._ctx['subscriptions'] = set()
     self._ctx['buffer'] = {}
     self._ctx['is_congested'] = _create_event(False)
     return NO_ERROR
 
-  def disconnect(self) -> Error | NO_ERROR_T:
+  async def disconnect(self) -> Error | NO_ERROR_T:
     """Disconnect from the currently connected Broker"""
     if 'broker' not in self._ctx: return NO_ERROR
-    err = self._ctx['broker'].disconnect(self.id)
+    err = await self._ctx['broker'].disconnect(self.id)
     if err is not NO_ERROR: return err
     # Clear the Consumer State
     for key in ('broker', 'rx', 'buffer', 'is_congested'):
       del self._ctx[key]
     return NO_ERROR
 
-  def subscribe(self, channel_id: str, msg_filter: Callable[[str, OBJ, userdata_t], bool] | None = None) -> Error | NO_ERROR_T:
+  def subscribe(self, channel_id: str, msg_filter: msg_filter_t | None = None) -> Error | NO_ERROR_T:
     """Subscribe to a channel on the Broker"""
     if 'broker' not in self._ctx: raise RuntimeError(f"Consumer `{self.id}` is not connected to a Broker")
     if channel_id not in self._ctx['buffer']: self._ctx['buffer'][channel_id] = deque()
@@ -990,196 +794,7 @@ class Consumer:
           self._ctx['buffer'][channel_id].append(msg) # Stash the message if it's not the right channel
           msg = None # Reset the message; we haven't found it yet
 
-    return None, (
+    return NO_ERROR, (
       msg['payload'],
       msg['metadata'].get('userdata', {}),
     )
-
-async def _():
-  """
-  
-  An Example Implementation of Message Multicasting
-  
-  """
-  from typing import Literal
-  from collections import deque
-  broker = Broker()
-
-  async def emulate_producer_publish(
-    pub_id: str,
-    channel_id: str,
-  ):
-    """Emulate a Producer Publishing Messages to a Channel"""
-    while True:
-      await broker._ctx['rxq'][pub_id].push(Message.factory(
-        payload={'time': time.monotonic_ns()},
-        sender=pub_id,
-        recepient=broker.id,
-        channel=channel_id,
-      ))
-  
-  async def emulate_consumer_listen(
-    sub_id: str,
-    channel_id: str,
-  ) -> Message[OBJ]:
-    """Emulate a Consumer Listening for Messages"""
-    while True:
-      msg = await broker._ctx['txq'][sub_id].pop()
-      if msg['metadata']['channel'] != channel_id: continue # TODO
-      pass # NOTE: We would otherwise do something w/ this
-
-  def _get_caching_queue(client_id: str) -> ItemLog[Message[OBJ]]:
-    """Returns an unbounded caching Queue for further evaluation"""
-    if client_id not in broker._ctx['queues']['cache']:
-      broker._ctx['queues']['cache'][client_id] = ItemLog()
-    return broker._ctx['queues']['cache'][client_id]
-
-  def _get_delivery_queue(client_id: str) -> ItemLog[Message[OBJ]]:
-    """Returns the delivery queue for a client"""
-    if client_id not in broker._ctx['queues']['delivery']:
-      broker._ctx['queues']['delivery'][client_id] = ItemLog(deque(maxlen=100))
-    return broker._ctx['queues']['delivery'][client_id]
-
-  def _duplicate_message(client_id: str, msg: Message[OBJ]) -> Message[OBJ]:
-    raise NotImplementedError
-
-  async def multicast_loop(rxq: msglog_t):
-    """Handle Message Multicasting"""
-    while True:
-      msg = await rxq.pop()
-      channel_id = msg['metadata']['channel']
-      consumers = broker.channel_registry.consumers[channel_id]
-      for cid in consumers:
-        consumer_caching_queue = _get_caching_queue(cid)
-        assert not consumer_caching_queue.full # The Caching Queue should be unbounded to prevent blocking
-        consumer_caching_queue.push(_duplicate_message(cid, msg))
-  
-  async def client_delivery_eval_loop(
-    client_id: str,
-    caching_queue: ItemLog[Message[OBJ]],
-    delivery_queue: ItemLog[Message[OBJ]],
-    client_filter: Callable[..., bool],
-    action_on_block: Literal['wait', 'drop'],
-  ):
-    """Handles Evaluation of Message Delivery to a client"""
-
-    while True:
-      msg = await caching_queue.pop()
-      if not client_filter(
-        channel_id=msg['metadata']['channel'],
-        payload=msg['payload'],
-        userdata=msg['metadata']['userdata'],
-      ): continue # Drop the Message
-      if delivery_queue.full:
-        if action_on_block == 'drop':
-          # Log a warning
-          continue
-        elif action_on_block == 'wait':
-          await delivery_queue.wait_until(state='NotFull')
-        else: raise NotImplementedError('TODO')
-      
-      assert not delivery_queue.full
-      await delivery_queue.push(msg)
-  
-  async def client_tx_loop(
-    client_id: str,
-    txq: ItemLog[Message[OBJ]],
-    delivery_queue: ItemLog[Message[OBJ]],
-  ):
-    """Handles the transimission of messages to be delivered to the client"""
-    while True:
-      await txq.push(
-        await delivery_queue.pop()
-      )
-
-async def _example_subscription_delivery():
-  """
-  
-  An Example of how Subscription delivery should be implemented between Message Broker & Subscribing Client
-  
-  """
-
-  channel_registry = ChannelRegistry()
-  client_channel_filters: dict[str, dict[str, Callable[..., bool]]] = {}
-  client_connected_state: dict[str, asyncio.Event] = {}
-
-  async def _client_delivery_eval_loop(
-    client_id: str,
-    client_delivery_queue: ItemLog[Message[OBJ]],
-    client_tx_queue: ItemLog[Message[OBJ]],
-  ):
-    pop = False
-    while True:
-      if pop:
-        await client_delivery_queue.pop()
-        pop = False
-      msg = await client_delivery_queue.peek()
-      channel_id = msg['metadata']['channel']
-      
-      assert channel_id in channel_registry.channels
-      assert client_id in channel_registry.subscriptions[channel_id]
-      if not client_connected_state[client_id].is_set(): await client_connected_state[client_id].wait()
-
-      pop = True
-
-      # Eval if we should Deliver
-      if not (client_channel_filters[client_id][channel_id])(msg): continue
-      await client_tx_queue.push(msg)
-  
-  async def _client_tx_loop(
-    client_id: str,
-    client_tx_queue: ItemLog[Message[OBJ]],
-    client_listener: Callable[..., Coroutine[None, None, Error | NO_ERROR_T]],
-    congestion_mode: Literal['buffer', 'drop'],
-  ):
-    congestion_over: asyncio.Event = None
-    mode: Literal['default', 'congested'] = 'default'
-    pop = False
-    buffer = []
-
-    async def _deliver_msg(msg: Message[OBJ]) -> bool:
-      nonlocal mode
-      nonlocal congestion_over
-      err = await client_listener(msg)
-      if err is not NO_ERROR:
-        if err['kind'] == 'congested':
-          mode = 'congested'
-          congestion_over = err['session']
-          return False
-        else: raise NotImplementedError
-      return True
-
-    while True:
-      if pop:
-        await client_tx_queue.pop()
-        pop = False
-      msg = await client_tx_queue.peek()
-      assert msg['metadata']['recipient'] == client_id
-
-      pop = True
-      if mode == 'default':
-        if not _deliver_msg(msg):
-          pop = False
-          continue
-      elif mode == 'congested':
-        assert congestion_over is not None
-        if congestion_over.is_set():
-          # Attempt to Deliver the buffered Messages
-          idx = 0
-          for msg in buffer:
-            if not _deliver_msg(msg):
-              pop = False
-              break
-            else: idx += 1
-          buffer = buffer[idx:]
-          if len(buffer) <= 0: # All Messages were delivered
-            mode = 'default'
-            congestion_over = None
-            continue
-        else:
-          if congestion_mode == 'buffer':
-            buffer.append(msg)
-          elif congestion_mode == 'drop':
-            continue
-          else: raise ValueError(congestion_mode)
-      else: raise ValueError(mode)
