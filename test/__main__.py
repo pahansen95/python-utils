@@ -54,7 +54,7 @@ def main(args: tuple[str, ...], kwargs: CLI_KWARGS) -> int:
   subcmd = args[0]
   if subcmd == 'run':
     groups = args[1:] if len(args) > 1 else None
-    return asyncio.run(cmd_run_tests(groups=groups))
+    return asyncio.run(cmd_run_tests(groups=groups), debug=True)
   else:
     raise CLIError(f"Unknown subcommand '{subcmd}'")
 
