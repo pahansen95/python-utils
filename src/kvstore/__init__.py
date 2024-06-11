@@ -2,10 +2,10 @@ from __future__ import annotations
 from typing import Protocol, Any, Generic, TypeVar, runtime_checkable
 from abc import abstractmethod
 from collections.abc import ByteString, Callable, Iterable, Mapping
-from dataclasses import dataclass, field, KW_ONLY
+from dataclasses import dataclass, field
 from pathlib import PurePath
-import orjson
 from frozendict import frozendict
+import orjson
 
 T = TypeVar('T')
 
