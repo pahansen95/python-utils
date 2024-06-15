@@ -15,6 +15,9 @@ from cryptography.hazmat.backends import default_backend
 from os import urandom
 
 from .. import KVStore, Key, Value, EmptyValue, PathKey, EMPTY, EMPTY_META
+from utils.concurrency.comms.pubsub.backends.local import (
+  Broker, Producer, Consumer, Message
+)
 import utils.concurrency.aio.watch as aiow
 import utils.filesystem as fs
 from utils.itertools import group_by, chain_from_iter
