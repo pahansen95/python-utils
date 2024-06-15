@@ -131,12 +131,12 @@ class IOWatcher:
     logger.trace(f"fd:{fd} Access Modes `{fd_acc_modes:>08b}`")
     fd_readable = bool(fd_acc_modes & os.O_RDONLY) or bool(fd_acc_modes & os.O_RDWR)
     fd_writeable = bool(fd_acc_modes & os.O_WRONLY) or bool(fd_acc_modes & os.O_RDWR)
-    if eventmask & IOEvent.READ and not fd_readable: logger.warning(f"fd:{fd} didn't seem to be opened in a readable mode; is this intentional?")
-    if eventmask & IOEvent.WRITE and not fd_writeable: logger.warning(f"fd:{fd} didn't seem to be opened in a writable mode; is this intentional?")
+    if eventmask & IOEvent.READ and not fd_readable: logger.debug(f"fd:{fd} didn't seem to be opened in a readable mode; is this intentional?")
+    if eventmask & IOEvent.WRITE and not fd_writeable: logger.debug(f"fd:{fd} didn't seem to be opened in a writable mode; is this intentional?")
 
     if fd in self.fds:
       _backend, _mask = self.fds[fd]
-      if _backend != watch_backend: logger.warning(f"fd {fd} has already been registered with {watch_backend} instead of {_backend}")
+      if _backend != watch_backend: logger.debug(f"fd {fd} has already been registered with {watch_backend} instead of {_backend}")
       if _mask != eventmask:
         if _backend == WatchBackend.EPOLL: self.epoll.modify(fd, ioevent_to_mask(eventmask, WatchBackend.EPOLL) | select.EPOLLET)
         elif _backend == WatchBackend.POLL: self.poll.modify(fd, ioevent_to_mask(eventmask, WatchBackend.POLL))
@@ -144,7 +144,7 @@ class IOWatcher:
       self.fds[fd] = (watch_backend, eventmask)
     else:
       selected_backend = self._fd_smart_register(fd, eventmask, watch_backend)
-      if selected_backend != watch_backend: logger.warning(f"fd {fd} was registered with {selected_backend} instead of {watch_backend}")
+      if selected_backend != watch_backend: logger.debug(f"fd {fd} was registered with {selected_backend} instead of {watch_backend}")
       self.fds[fd] = (selected_backend, eventmask)
       self._ctx.event_logs[fd] = ItemLog()
 
