@@ -5,47 +5,64 @@ from collections.abc import Generator
 from loguru import logger
 
 ### Local Imports
-from . import pkg, artifact
+from . import pkg, artifact, requirements
 ###
 
-
-def _build_util_pkg(
+def _generate_utils_pkg_spec(
   cfg: Config,
   workdir: pathlib.Path
 ) -> int:
-  srcdir = pathlib.Path(cfg['spec']['source'])
-  if not (srcdir.exists() and srcdir.is_dir()):
-    raise CLIError(f"Package Source directory '{srcdir}' does not exist")
-  logger.info(f"Building package {cfg['spec']['build']['name']} from {srcdir.as_posix()}")
-  assembly: dict[str, Any] = pkg.assemble(
-    build_spec=cfg['spec']['build'],
-    srcdir=srcdir,
-    workdir=workdir,
-  )
-  logger.debug(f"{assembly=}")
-  logger.success(f"Package {cfg['spec']['build']['name']} built under {workdir.as_posix()}")
+  """Generates a Package Spec given a GenerationConfig"""
+  pkg_dir = workdir / cfg['spec']['source'].lstrip('/')
+  logger.debug(f"Checking for the declared Package Directory: {pkg_dir.as_posix()}")
+  if not (pkg_dir.exists() and pkg_dir.resolve().is_dir()): raise CLIError(f"Package Source directory '{pkg_dir}' does not exist")
+  pkg_spec = pkg.assemble_spec(pkg_dir, cfg['spec']['build']['include'], cfg['spec']['build']['exclude'])
+  sys.stdout.buffer.write(orjson.dumps(pkg_spec, option=orjson.OPT_APPEND_NEWLINE))
 
-  artifact_spec: artifact.TarSpec = cfg['spec']['artifact'] | {
-    'include': [
-      pathlib.Path(assembly[k]).relative_to(workdir).as_posix()
-      for k in ('pkgdir', 'requirements') if k in assembly
-    ]
-  }
-  logger.debug(f"{artifact_spec=}")
-  logger.info(f"Creating Artifact at {artifact_spec['dst']}")
-  assembly |= artifact.create(
-    spec=artifact_spec,
-    workdir=workdir,
-  )
-  logger.debug(f"{assembly=}")
-  logger.success(f"Artifact created at {assembly['artifact']}")
+def _build_utils_pkg(
+  pkg_spec: pkg.PkgSpec,
+  cfg: Config,
+  workdir: pathlib.Path
+) -> int:
+  pkg_dir = workdir / cfg['spec']['source'].lstrip('/')
+  data_dir = pkg_dir.parent
+  logger.debug(f"Checking for the declared Package Directory: {pkg_dir.as_posix()}")
+  if not (pkg_dir.exists() and pkg_dir.resolve().is_dir()): raise CLIError(f"Package Source directory '{pkg_dir}' does not exist")
+
+  logger.info('Assembling the Utils Package into an Artifact')
+  pkg_files = pkg.list_pkg_files(pkg_dir, pkg_spec)
+  logger.debug(f"Found Package Files...\n{orjson.dumps(sorted(p.relative_to(workdir).as_posix() for p in pkg_files), option=orjson.OPT_INDENT_2).decode()}")
+  pkg_reqs = pkg.merge_requirements(pkg_spec)
+  logger.debug(f"Merged Requirements...\n{orjson.dumps(pkg_reqs, option=orjson.OPT_INDENT_2).decode()}")
+  (req_file := pkg_dir.parent / 'requirements.txt').write_text('\n'.join(
+    requirements.RequirementSpec.render_requirement_line(req)
+    for _, req in sorted(
+      pkg_reqs.items(),
+      key=lambda item: item[0],
+    )
+  ))
+
+  artifact_files: list[str] = [p.relative_to(data_dir).as_posix() for p in pkg_files]
+  if len(artifact_files) <= 0: raise CLIError("The Package Spec didn't generate any files to package; double check your include/exclude filters in the Config")
+  artifact_files.insert(0, req_file.relative_to(data_dir).as_posix())
+  logger.debug(f"Will assemble the following Files...{orjson.dumps(artifact_files, option=orjson.OPT_INDENT_2).decode()}")
+  
+  if cfg['spec']['artifact']['kind'].startswith('tar'):
+    artifact_spec: artifact.TarSpec = cfg['spec']['artifact'] | {
+      'include': artifact_files,
+    }
+  else: raise NotImplementedError(cfg['spec']['artifact']['kind'])
+  artifact.validate_artifact_spec(artifact_spec)
+  logger.debug("Creating the Artifact")
+  assembly = artifact.create(artifact_spec, data_dir, workdir)
+  logger.success(f"Artifact is located at {assembly['artifact']}")
 
   sys.stdout.buffer.write(orjson.dumps(assembly, option=orjson.OPT_APPEND_NEWLINE))
   return 0
 
 class Config(TypedDict):
   metadata: dict[str, Any]
-  spec: dict
+  spec: Config.Spec
 
   @staticmethod
   def validate(cfg: Config):
@@ -61,18 +78,18 @@ class Config(TypedDict):
     source: str
     """Path to the Source Directory containing the Package; if relative it is taken relative to the working directory"""
     artifact: Config.PartialArtifactSpec
-    build: pkg.BuildSpec
+    build: Config.BuildSpec
     """The Build Spec"""
     
     @staticmethod
     def validate(spec: Config.Spec):
-      logger.debug("Validating the Configuration Spec")
+      logger.debug("Validating the config.spec")
       if not isinstance(spec, dict): raise CLIError("Spec must be a dictionary")
       if 'build' not in spec: raise CLIError("Spec must contain a 'build' section")
       if not isinstance(spec['build'], dict): raise CLIError("Build section must be a dictionary")
       if 'source' not in spec: raise CLIError("Spec must contain a 'source' section")
       if not isinstance(spec['source'], str): raise CLIError("Source section must be a string")
-      pkg.BuildSpec.validate(spec['build'])
+      Config.BuildSpec.validate(spec['build'])
       Config.PartialArtifactSpec.validate(spec['artifact'])
   
   class PartialArtifactSpec(TypedDict):
@@ -81,31 +98,53 @@ class Config(TypedDict):
 
     @staticmethod
     def validate(spec: Config.PartialArtifactSpec):
+      logger.debug("Validating config.spec.artifact")
       if not isinstance(spec, dict): raise CLIError("Artifact Spec must be a dictionary")
       if 'kind' not in spec: raise CLIError("Artifact Spec must contain a 'kind' key")
       if spec['kind'] not in ('tar.gz', 'tar.xz', 'tar.bz2', 'wheel'): raise CLIError("Artifact Spec 'kind' must be one of 'tar.gz', 'tar.xz', 'tar.bz2', 'wheel")
       if 'dst' not in spec: raise CLIError("Artifact Spec must contain a 'dst' key")
 
-  @staticmethod
-  def load(file: pathlib.Path) -> Config:
-    if file.suffix == '.json': return orjson.loads(file.read_text())
-    elif file.suffix in ('.yaml', '.yml'): return yaml.safe_load(file.read_text())
-    else: raise CLIError(f"Unsupported configuration format: {file.suffix}")
+  class BuildSpec(TypedDict):
+    include: list[str]
+    """List of packages to include as Posix Shell Glob Patterns (NOTE: Package Seperators `.` are replaced with path seperators `/`)"""
+    exclude: NotRequired[list[str]]
+    """List of packages to exclude as Posix Shell Glob Patterns (NOTE: Package Seperators `.` are replaced with path seperators `/`)"""
 
-def _load_config(file: str) -> Config:
-  cfg_file = pathlib.Path(file)
-  if not (cfg_file.exists() or cfg_file.is_file()): raise CLIError(f"Configuration file '{cfg_file}' does not exist or is not a file")
-  cfg = Config.load(cfg_file)
-  Config.validate(cfg)
-  return cfg
+    @staticmethod
+    def validate(spec: Config.BuildSpec):
+      logger.debug("Validating config.spec.build")
+      if not isinstance(spec, dict): raise CLIError("Build Spec must be a dictionary")
+      if 'include' not in spec: raise CLIError("Build Spec must contain an 'include' key")
+      if not isinstance(spec['include'], list): raise CLIError("Build Spec 'include' must be a list")
+      if 'exclude' in spec and not isinstance(spec['exclude'], list): raise CLIError("Build Spec 'exclude' must be a list")
+
+def _load_map(file: str | None, spec: Config | pkg.PkgSpec) -> Config | pkg.PkgSpec:
+  if file:
+    _file = pathlib.Path(file)
+    if not (_file.exists() or _file.is_file()): raise CLIError(f"File '{_file}' does not exist or is not a file")
+    if _file.suffix == '.json': _spec = orjson.loads(_file.read_text())
+    elif _file.suffix in ('.yaml', '.yml'): _spec = yaml.safe_load(_file.read_text())
+    else: raise CLIError(f"Unsupported configuration format: {_file.suffix}")
+  else:
+    try: _spec = orjson.loads(sys.stdin.read())
+    except orjson.JSONDecodeError:
+      try: _spec = yaml.safe_load(sys.stdin.read())
+      except yaml.YAMLError as e: raise CLIError(f"Failed to parse stdin: {e}")
+
+  spec.validate(_spec)
+  return _spec
 
 def main(args: tuple[str, ...], kwargs: CLI_KWARGS) -> int:
   logger.trace(f"Starting main function with arguments: {args}\nKeywords: {kwargs}")
   if len(args) < 1: raise CLIError("No subcommand provided")
   subcmd = args[0]
-  if subcmd == 'pkg':
-    cfg = _load_config(kwargs['config'])
-    return _build_util_pkg(cfg, pathlib.Path(kwargs['build']))
+  if subcmd == 'gen':
+    cfg: Config = _load_map(kwargs['config'], Config)
+    return _generate_utils_pkg_spec(cfg, pathlib.Path(kwargs['build']))
+  elif subcmd == 'build':
+    cfg: Config = _load_map(kwargs['config'], Config)
+    pkg_spec: pkg.PkgSpec = _load_map(kwargs.get('spec'), pkg.PkgSpec)
+    return _build_utils_pkg(pkg_spec, cfg, pathlib.Path(kwargs['build']))
   else:
     raise CLIError(f"Unknown subcommand '{subcmd}'")
 
@@ -143,6 +182,8 @@ class CLI_KWARGS(TypedDict):
   """The Build Directory"""
   config: str
   """The Build Configuration File"""
+  spec: NotRequired[str]
+  """The Package Specification File; if omitted, it is read from stdin"""
 
 def parse_argv(argv: list[str], env: dict[str, str]) -> tuple[tuple[str, ...], CLI_KWARGS]:
   def _default_build_dir() -> str: return (pathlib.Path(env['CI_PROJECT_DIR']) / '.cache/build').as_posix() if 'CI_PROJECT_DIR' in env else os.getcwd()

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import re
+import re, pathlib
 from typing import TypedDict, NotRequired
 
 class RequirementSpec(TypedDict):
@@ -14,6 +14,22 @@ class RequirementSpec(TypedDict):
   """The URL for the Package"""
   marker: NotRequired[str]
   """The Marker for the Package"""
+
+  @staticmethod
+  def validate(spec: RequirementSpec):
+    if not isinstance(spec, dict): raise ValueError("RequirementSpec must be a dictionary")
+    if 'name' not in spec: raise ValueError("RequirementSpec must contain a 'name' key")
+    if not isinstance(spec['name'], str): raise ValueError("RequirementSpec 'name' must be a string")
+    if 'extras' in spec:
+      if not isinstance(spec['extras'], list): raise ValueError("RequirementSpec 'extras' must be a list")
+      if not all(isinstance(e, str) for e in spec['extras']): raise ValueError("RequirementSpec 'extras' must be a list of strings")
+    if 'versions' in spec:
+      if not isinstance(spec['versions'], list): raise ValueError("RequirementSpec 'versions' must be a list")
+      if not all(isinstance(v, str) for v in spec['versions']): raise ValueError("RequirementSpec 'versions' must be a list of strings")
+    if 'url' in spec:
+      if not isinstance(spec['url'], str): raise ValueError("RequirementSpec 'url' must be a string")
+    if 'marker' in spec:
+      if not isinstance(spec['marker'], str): raise ValueError("RequirementSpec 'marker' must be a string")
 
   @staticmethod
   def parse_requirement_line(requirement: str) -> RequirementSpec:
@@ -78,3 +94,15 @@ class RequirementSpec(TypedDict):
     requirement_line = f"{name}{extras_part} {versions_part}{url_part}{marker_part}".strip()
     
     return requirement_line
+
+def parse_requirements_file(file: pathlib.Path) -> dict[str, RequirementSpec]:
+  requirements = {}
+  with file.open('r') as f:
+    for line in f:
+      line = line.strip()
+      if not line or line.startswith('#'):
+        continue
+      spec = RequirementSpec.parse_requirement_line(line)
+      if spec['name'] in requirements: requirements[spec['name']] |= spec
+      else: requirements[spec['name']] = spec
+  return requirements

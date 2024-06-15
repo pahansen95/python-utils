@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import TypedDict, NotRequired, Literal
+from loguru import logger
 import pathlib, subprocess, sys
 
 ### Local Imports
@@ -44,21 +45,30 @@ class AssemblyOutput(TypedDict):
 
 def create(
   spec: ArtifactSpec,
+  data_dir: pathlib.Path,
   workdir: pathlib.Path,
 ) -> AssemblyOutput:
-  """Create the Artifact"""
+  """Create the Artifact
+  
+  Args:
+    spec: The Artifact Spec
+    workdir: The Working Directory for tar
+    data_dir: The Root Directory of the artifact data
+  """
   
   if spec['kind'] in ('tar.gz', 'tar.xz', 'tar.bz2'):
     # Create the Tarball
     (dst := pathlib.Path(spec['dst']))
-    if not dst.is_absolute(): dst = workdir / dst
+    if not dst.is_absolute(): dst = (workdir / dst).absolute()
     if dst.exists(): raise BuildError(f"Artifact '{dst}' already exists")
+
     proc: subprocess.CompletedProcess = subprocess.run([
       'tar',
       '-czvf', dst.as_posix(),
-      '-C', workdir.as_posix(),
+      '-C', data_dir.as_posix(),
       *spec['include']
-    ], stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr, check=True)
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    logger.debug('tar log...\n' + proc.stdout.decode() + '\n' + proc.stderr.decode())
     if proc.returncode != 0: raise BuildError(f"Failed to create Artifact '{dst}'")
     return { 'artifact': dst.as_posix() }
   else: raise NotImplementedError(f"Artifact Kind '{spec['kind']}' is not supported")
