@@ -4,18 +4,17 @@ Extend the Utils Package with C Source using the `cffi` package.
 
 """
 from __future__ import annotations
-import cffi, pathlib, blake3
+import cffi, pathlib, blake3, sys
 from typing import TypedDict
+from loguru import logger
 from dataclasses import dataclass, field, KW_ONLY
 
-### TypeHints
-from _cffi_backend import _Allocator
-###
+import cffi.commontypes
 
 _cffibuilder = cffi.FFI()
 """The Global CFFI Instance for building modules."""
 
-def c_new_malloc(*args, **kwargs) -> _Allocator: return _cffibuilder.new_allocator(*args, **kwargs)
+def c_new_malloc(*args, **kwargs): return _cffibuilder.new_allocator(*args, **kwargs)
 c_malloc = c_new_malloc(should_clear_after_alloc=False)
 """The default Global Memory Allocator"""
 c_buffer = _cffibuilder.buffer
@@ -76,15 +75,14 @@ class Registry:
     del self.modules[name]
     del self._ctx["status"][name]
     
-  def compile_module(self, name: str) -> None:
+  def compile_module(self, name: str, module_cache: pathlib.Path) -> None:
     """Compiles the Module Source Code into a shared library"""
     if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
-    (_module_cache := self.cache_dir / name).mkdir(mode=0o755, parents=False, exist_ok=True)
-    if not (_module_cache.exists() and _module_cache.is_dir()): raise ValueError(f"Module {name} has not been built yet.")
+    if not (module_cache.exists() and module_cache.is_dir()): raise ValueError(f"Module {name} has not been built yet.")
     _ffibuilder = self._ctx["ffibuilder"]
-    _ffibuilder.cdef((_module_cache / 'src' / f"{name}.h").read_text())
-    _ffibuilder.set_source(name, (_module_cache / 'src' / f"{name}.c").read_text())
-    _ffibuilder.compile(tmpdir=_module_cache.as_posix(), target=f'{name}.*', verbose=True)
+    _ffibuilder.cdef((module_cache / 'src' / f"{name}.h").read_text())
+    _ffibuilder.set_source(name, (module_cache / 'src' / f"{name}.c").read_text())
+    _ffibuilder.compile(tmpdir=module_cache.as_posix(), target=f'{name}.*', verbose=True)
 
   def assemble_module(self, name: str) -> pathlib.Path:
     """Assembles the Module for compilation"""
@@ -119,7 +117,7 @@ class Registry:
       fingerprint_file
     )
 
-  def build_module(self, name: str) -> BuildStatus:
+  def build_module(self, name: str, add_to_path: bool = True) -> BuildStatus:
     """Intelligently builds the Module"""
     if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
 
@@ -129,7 +127,11 @@ class Registry:
       fingerprint_file.write_text(fingerprint)
       self.compile_module(name, module_cache)
     
-    return {"cache": module_cache, "fingerprint": fingerprint}
+    self._ctx['status'][name] = {"cache": module_cache, "fingerprint": fingerprint}
+    if add_to_path: sys.path.insert(0, module_cache.as_posix())
+    else: logger.debug(f'External C Module `{name}` was not added to Python Search Path')
+
+    return {} | self._ctx['status'][name] # Return a Copy
 
 c_registry = Registry()
 """The Global C Module Registry."""
