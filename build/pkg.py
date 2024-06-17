@@ -1,5 +1,5 @@
 from __future__ import annotations
-import pathlib, yaml, fnmatch
+import pathlib, yaml, fnmatch, itertools
 from typing import Literal, TypedDict, NotRequired
 from collections import deque
 from loguru import logger
@@ -59,12 +59,12 @@ class PkgSpec(TypedDict):
     if 'extern' in spec: PkgSpec.PkgMetadata.validate(spec['metadata'])
 
 def filter_pkg(pkg_name: str, include: list[str], exclude: list[str]) -> bool:
+  if len(include) <= 0: raise ValueError('At least 1 inclusion Glob Pattern must be passed')
   _pkg_name = pkg_name.replace('.', '/')
   logger.trace(f"Evaluating Pkg Name: {_pkg_name}")
-  match = (
-    any(fnmatch.fnmatch(_pkg_name, pattern) for pattern in include)
-    and not any(fnmatch.fnmatch(_pkg_name, pattern) for pattern in exclude)
-  )
+  should_include = any(fnmatch.fnmatch(_pkg_name, pattern) for pattern in include)
+  should_exclude = any(fnmatch.fnmatch(_pkg_name, pattern) for pattern in exclude) if exclude else False
+  match = should_include and not should_exclude
   if not match: logger.debug(f"EXCLUDE `{_pkg_name}`")
   return match
 
@@ -107,61 +107,67 @@ def parse_pkg(
   if '.data' in children: spec['data'] = (pkg_path / '.data').as_posix()
 
   # Package Modules
-  modules = [
-    p.stem for p in filter(
-      lambda p: (
-        p.is_file()
-        and (''.join(p.suffixes) in (
-          '.py',
-          '.pyi',
-          '.pyc',
-        ))
-        and (p.name.split('.', maxsplit=1)[0] not in (
-          '__init__',
-          '__main__',
-        ))
-        and filter_pkg(f'{pkg_name}.{p.stem}', include_pkg, exclude_pkg)
-      ),
-      pkg_path.iterdir(),
+  modules = sorted(list(set(itertools.chain.from_iterable(
+    (
+      p.stem
+      for p in pkg_path.glob(pattern)
+      if (
+        p.name.count('.') == 1
+        and p.stem not in (
+          '__init__', '__main__',
+        ) and filter_pkg(f"{pkg_name}.{p.stem}", include_pkg, exclude_pkg)
+      )
+    ) for pattern in (
+      '*.py',
+      '*.pi',
+      '*.pyc',
     )
-  ]
+  ))))
+  logger.debug(f"Found Modules...\n" + '\n'.join(modules))
   if modules: spec['modules'] = modules
 
   # Extern Package Files
   if spec['kind'] == 'extern':
     logger.trace('Searching for External Source Files')
-    extern = []
+    extern: list[pathlib.Path] = []
     if 'c' in spec['metadata']['extern']:
       logger.trace('Looking for C & C++ Source Files')
-      extern.extend(
-        p.relative_to(pkg_path).as_posix()
-        for p in pkg_path.iterdir()
-        if (
-          # Currently there are no subdirectories for an External C Package
-          ''.join(p.suffixes) in (
-            '.c',
-            '.cpp',
-            '.h',
-            '.hpp',
-          )
+      extern.extend(itertools.chain.from_iterable(
+        (
+          p for p in pkg_path.glob(pattern)
+        ) for pattern in (
+          'src/**/*.c',
+          'src/**/*.cpp',
+          'include/**/*.h',
+          'include/**/*.hpp',
+          'lib/**/*.a',
+          'lib/**/*.so',
         )
-      )
+      ))
     
     if extern:
-      logger.trace("Found the following External Source Files...\n" + '\n'.join(extern))
-      spec['extern'] = extern
+      spec['extern'] = sorted(
+        p.relative_to(pkg_path).as_posix()
+        for p in set(extern)
+      )
+      logger.trace("Found the following External Source Files...\n" + '\n'.join(spec['extern']))
     else: logger.warning(f"Package `{spec['name']}` declares itself as External but contains no non-Python source files")
   
   # Potential Subpackages
-  maybe_subpkg = list(filter(
+  maybe_subpkg = sorted(set(filter(
     lambda p: (
       p.is_dir()
-      and p.name not in spec.get('extern', [])
+      and p.name.count('.') <= 0
+      and (True if spec['kind'] != 'extern' else (
+        # The following conditions must hold true when this is an External Package
+        p.name not in ('src', 'include', 'lib') # Folders reserved for External C/C++ Modules
+      ))
       and p.name not in ('.data', '__pycache__')
       and filter_pkg(f"{pkg_name}.{p.name}", include_pkg, exclude_pkg)
     ),
     pkg_path.iterdir(),
-  ))
+  )))
+  logger.debug(f"Found Potential Subpackages...\n" + '\n'.join(map(str, maybe_subpkg)))
 
   return (spec, maybe_subpkg)
 
