@@ -4,10 +4,11 @@ Extend the Utils Package with C Source using the `cffi` package.
 
 """
 from __future__ import annotations
-import cffi, pathlib, blake3, sys
+import cffi, pathlib, blake3, sys, shutil
 from typing import TypedDict
 from loguru import logger
 from dataclasses import dataclass, field, KW_ONLY
+from itertools import chain
 
 import cffi.commontypes
 
@@ -27,11 +28,36 @@ c_release = _cffibuilder.release
 """The Global CFFI `release` function"""
 
 class BuildSpec(TypedDict):
-  """A Specification for Building a CFFI Module."""
-  headers: list[pathlib.Path]
-  """The Headers to include in the Module; will be concatenated in supplied order as the `cdef` for the cffi builder."""
-  source: list[pathlib.Path]
-  """The Module Source Code; will be concatenated in supplied order as the `source` for the cffi builder."""
+  """A Specification for Building a CFFI Package.
+  
+  Write your C Library rooted at the package directory.
+
+  When the CFFI Package is compiled, all the declared headers will be
+  injected into the CFFI Package (via the `ffibuilder.set_source`) function.
+
+  Compilation will target all included C Source Files & will link any specified libraries.
+  
+  """
+  cdef: str
+  """The CFFI cdef used to generate the API Integrated Python Module"""
+  include: list[str]
+  """The Module Header Files to inject into the CFFI Package; must be relative to the package's `include` folder."""
+  sources: list[str]
+  """The Module Source Code Files to compile; must be relative to the package's root folder. ie. takes the form ['src/foo.c', 'src/bar.c']"""
+
+def calculate_module_fingerprint(pkgdir: pathlib.Path, build_spec: BuildSpec, glob: list[str] = ['src/**/*.c', 'include/**/*.h']) -> str:
+  """Calculates an identity fingerprint for the Library + BuildSpec"""
+  lib_files = sorted(chain.from_iterable(
+    pkgdir.glob(pattern)
+    for pattern in glob
+  ))
+  assert len(lib_files) > 0
+  hasher = blake3.blake3()
+  hasher.update(build_spec['cdef'].encode())
+  hasher.update(''.join(build_spec['include']).encode())
+  hasher.update(''.join(build_spec['sources']).encode())
+  for f in lib_files: hasher.update_mmap(f.as_posix())
+  return hasher.hexdigest()
 
 class BuildStatus(TypedDict):
   """The Build Status of a Module."""
@@ -41,14 +67,14 @@ class BuildStatus(TypedDict):
   """The Fingerprint identifying the build."""
 
 class _Ctx(TypedDict):
-  ffibuilder: cffi.FFI
-  """The FFI Instance to use for building Modules."""
+  ffibuilder: dict[str, cffi.FFI]
+  """The FFI Instance, per Module, to use for building the Module. The GLOBAL key is reserved for the Global FFI Instance."""
   status: dict[str, BuildStatus | None]
   """The Build Status of each Module in the Registry. None if the Module has not been built."""
 
   @staticmethod
   def default_factory() -> _Ctx:
-    return {"ffibuilder": _cffibuilder, "status": {}}
+    return {"ffibuilder": {'GLOBAL': _cffibuilder}, "status": {}}
 
 def _default_cache_dir() -> pathlib.Path:
   default_cache_dir = pathlib.Path(__file__).parent / ".cffibuild"
@@ -68,67 +94,99 @@ class Registry:
     if name in self.modules: raise ValueError(f"Module {name} already exists in the Registry.")
     self.modules[name] = build_spec
     self._ctx["status"][name] = None
+    self._ctx["ffibuilder"][name] = cffi.FFI()
+    (self.cache_dir / name).mkdir(mode=0o755, parents=False, exist_ok=True)
   
   def remove_module(self, name: str) -> None:
     """Remove a Module from the Registry."""
     if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
+    module_cache = self.cache_dir / name
+    if module_cache.exists(): shutil.rmtree(module_cache.as_posix())
     del self.modules[name]
     del self._ctx["status"][name]
+
+  def assemble_module(self, name: str, pkgdir: pathlib.Path, workdir: pathlib.Path) -> None:
+    """Assembles a well formed directory structure for compiling the Module. Links in the expected
     
-  def compile_module(self, name: str, module_cache: pathlib.Path) -> None:
+    Args:
+      name (str): The Name of the Module
+      pkgdir (Path): The Root of the (External) Package Directory
+      workdir (Path): The Working Directory we are assembling the Module into
+    
+    """
+
+    for subdir, optional in (
+      ('include', True),
+      ('src', False),
+      ('lib', True),
+    ):
+      targetdir = pkgdir / subdir
+      if not targetdir.exists():
+        if not optional: raise ValueError(f'Missing required Package Directory `{subdir.as_posix()}`')
+        logger.debug(f'Package Directory `{subdir}` does not exist; skipping...')
+        continue
+      linkdir = workdir / subdir
+      if linkdir.exists():
+        if linkdir.is_symlink() and linkdir.readlink() == targetdir: continue
+        elif linkdir.is_symlink(): linkdir.unlink()
+        elif linkdir.is_dir(): shutil.rmtree(linkdir.as_posix())
+        else: raise RuntimeError(f'Invalid File Kind for `{linkdir.as_posix()}`')
+      linkdir.symlink_to(targetdir, target_is_directory=True)
+    
+    (workdir / 'build').mkdir(mode=0o755, parents=False, exist_ok=True)
+
+  def compile_module(self, name: str, workdir: pathlib.Path) -> None:
     """Compiles the Module Source Code into a shared library"""
     if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
-    if not (module_cache.exists() and module_cache.is_dir()): raise ValueError(f"Module {name} has not been built yet.")
-    _ffibuilder = self._ctx["ffibuilder"]
-    _ffibuilder.cdef((module_cache / 'src' / f"{name}.h").read_text())
-    _ffibuilder.set_source(name, (module_cache / 'src' / f"{name}.c").read_text())
-    _ffibuilder.compile(tmpdir=module_cache.as_posix(), target=f'{name}.*', verbose=True)
-
-  def assemble_module(self, name: str) -> pathlib.Path:
-    """Assembles the Module for compilation"""
-    if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
-
-    _header: str = ""
-    for header in self.modules[name]["headers"]: _header += header.read_text()
-    _src: str = ""
-    for source in self.modules[name]["source"]: _src += source.read_text()
-
-    (module_cache := self.cache_dir / name).mkdir(mode=0o755, parents=False, exist_ok=True)
-    (_module_src := module_cache / 'src').mkdir(mode=0o755, parents=False, exist_ok=True)
-    (_module_src / f"{name}.h").write_text(_header)
-    (_module_src / f"{name}.c").write_text(_src)
-
-    return module_cache
-
-  def calculate_module_fingerprint(self, name: str, module_cache: pathlib.Path) -> tuple[bool, str, pathlib.Path]:
-    """Calculates the Fingerprint of a Module returning (diff, fingerprint, fingerprint_file)"""
-    if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
-    if not (module_cache.exists() and module_cache.is_dir()): raise ValueError(f"Module {name} has not been built yet.")
-    fingerprint_file = module_cache / ".fingerprint"
-
-    hasher = blake3.blake3()
-    hasher.update((module_cache / f"src/{name}.h").read_bytes())
-    hasher.update((module_cache / f"src/{name}.c").read_bytes())
-    new_fingerprint = hasher.hexdigest()
-    old_fingerprint = fingerprint_file.read_text().strip() if fingerprint_file.exists() else ''
-    return (
-      new_fingerprint != old_fingerprint,
-      new_fingerprint,
-      fingerprint_file
+    if not (workdir.exists() and workdir.is_dir()): raise ValueError(f"Working Directory does not exist: {workdir.as_posix()}")
+    include_dir = workdir / 'include'
+    lib_dir = workdir / 'lib'
+    build_spec = self.modules[name]
+    _src = '\n'.join(f'#include "{h}"' for h in build_spec['include'])
+    logger.debug(f'C Module `{name}` Generated Source...\n{_src}')
+    _ffibuilder = self._ctx["ffibuilder"][name]
+    _ffibuilder.cdef(build_spec['cdef'])
+    _ffibuilder.set_source(
+      module_name=name,
+      source=_src,
+      ### setuptools KWARGS: https://setuptools.pypa.io/en/latest/deprecated/distutils/apiref.html#distutils.core.Extension
+      include_dirs=[ include_dir.relative_to(workdir).as_posix() ] if include_dir.exists() else [],
+      sources=build_spec['sources'],
+      libraries=[ lib_dir.relative_to(workdir).as_posix() ] if lib_dir.exists() else [],
     )
+    _ffibuilder.compile(tmpdir=workdir.as_posix(), target=f'{name}.*', verbose=True)
 
-  def build_module(self, name: str, add_to_path: bool = True) -> BuildStatus:
-    """Intelligently builds the Module"""
-    if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
-
-    module_cache = self.assemble_module(name)
-    diff, fingerprint, fingerprint_file = self.calculate_module_fingerprint(name, module_cache)
-    if diff:
-      fingerprint_file.write_text(fingerprint)
-      self.compile_module(name, module_cache)
+  def build_module(
+    self,
+    name: str,
+    pkgdir: pathlib.Path,
+    fingerprint: str,
+    add_to_path: bool = True,
+    workdir: pathlib.Path = None
+  ) -> BuildStatus:
+    """Intelligently builds the Module
     
-    self._ctx['status'][name] = {"cache": module_cache, "fingerprint": fingerprint}
-    if add_to_path: sys.path.insert(0, module_cache.as_posix())
+    Args:
+      name (str): The Name of the Module
+      lib_dir (Path): The Root of the C Library Directory
+      fingerprint (str): A unique build identity for the current module; a diff from last build triggers a recompilation.
+      add_to_path (bool): Should the Python Search Path be updated w/ the Module's containing folder? Defaults to Yes.
+      workder (Opt[Path]): Override the expected working directory for a build; shouldn't be used normally.
+    """
+    if name not in self.modules: raise ValueError(f"Module {name} does not exist in the Registry.")
+    if workdir is None: workdir = self.cache_dir / name
+    if not workdir.exists(): raise ValueError(f"Working Directory does not exist: {workdir.as_posix()}")
+
+    fingerprint_file = workdir / '.fingerprint'
+    cached_fingerprint = fingerprint_file.read_text() if fingerprint_file.exists() else ''
+
+    if fingerprint != cached_fingerprint:
+      self.assemble_module(name, pkgdir, workdir)
+      self.compile_module(name, workdir)
+      fingerprint_file.write_text(fingerprint)
+    
+    self._ctx['status'][name] = {"cache": workdir, "fingerprint": fingerprint}
+    if add_to_path: sys.path.insert(0, workdir.as_posix())
     else: logger.debug(f'External C Module `{name}` was not added to Python Search Path')
 
     return {} | self._ctx['status'][name] # Return a Copy

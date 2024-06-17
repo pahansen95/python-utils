@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <errno.h>
+#include "aiolinux.h"
 
 static enum IOErrorReason {
   IOE_NONE = 0,

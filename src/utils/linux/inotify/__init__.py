@@ -1,129 +1,28 @@
-"""
-
-Provides a Wrapper around the Linux `inotify` interface.
-
-"""
 from __future__ import annotations
+import pathlib
+from utils.extern import active_backend, SystemBackend
+from utils.extern.c import calculate_module_fingerprint, BuildSpec, c_registry, c_malloc, c_buffer, c_from_buffer
 
-### C Integration ###
+if active_backend != SystemBackend.LINUX: raise RuntimeError("INotify is only supported on Linux")
 
-import cffi
-
-_c_src = """\
-#include <sys/inotify.h>
-#include <errno.h>
-
-static enum c_INotifyError {
-  INE_NONE,
-  INE_UNDEFINED,
-
-  /* Common Errors */
-  INE_BAD_ARGS, // A Bad Value was passed
-  INE_NO_MEM, // Out of Memory
-  INE_LIMIT, // Some File or Watch Limit was reached
-
-  /* Add Watch/Remove Errors */
-  INE_NO_READ, // The File Descriptor does not have read permissions
-  INE_ALREADY_EXIST, // The Watch for the Path already exists
-  INE_BAD_PATH, // The Path is invalid for some reason
-}
-
-void c_inotify_init(int flags, int result[2]) {
-  /*
-  Initialize a new INotify Instance.
-  Args:
-    flags: The Flags to use when initializing the INotify Instance.
-    result: A "tuple" of (errno, fd).
-  */
-  errno = 0; // Reset errno
-  result[1] = inotify_init1(flags); // Set the File Descriptor
-  if (errno == 0) { result[0] = INE_NONE; }
-  else if (errno == EINVAL) { result[0] = (int)INE_BAD_ARGS; }
-  else if (errno == EMFILE || errno == ENFILE) { result[0] = (int)INE_LIMIT; }
-  else if (errno == ENOMEM) { result[0] = (int)INE_NO_MEM; }
-  else { result[0] = (int)INE_UNDEFINED; }
-  return;
-}
-
-void c_inotify_add_watch(int fd, const char *path, int mask, int result[2]) {
-  /*
-  Add a Watch to a Path.
-  Args:
-    fd: The File Descriptor of the INotify Instance.
-    path: The Path to watch.
-    mask: The Mask of Events to watch for.
-    result: A "tuple" of (errno, watchdesc).
-  */
-  errno = 0; // Reset errno
-  result[1] = inotify_add_watch(fd, path, mask);
-  if (errno == 0) { result[0] = INE_NONE; } else
-  else if (errno == EINVAL || errno == EFAULT || errno == EBADF) { result[0] = (int)INE_BAD_ARGS; }
-  else if (errno == EACCES) { result[0] = (int)INE_NO_READ; }
-  else if (errno == EEXIST) { result[0] = (int)INE_ALREADY_EXIST; }
-  else if (errno == ENOENT || errno == ENAMETOOLONG || errno = ENOTDIR ) { result[0] = (int)INE_BAD_PATH; }
-  else if (errno == ENOSPC ) { result[0] = (int)INE_LIMIT; }
-  else { result[0] = (int)INE_UNDEFINED; }
-  return;
-}
-
-void c_inotify_rm_watch(int fd, int watchdesc, int result[1]) {
-  /*
-  Remove a Watch from a Path.
-  Args:
-    fd: The File Descriptor of the INotify Instance.
-    watchdesc: The Watch Descriptor to remove.
-    result: A "tuple" of (errno,).
-  */
-  errno = 0; // Reset errno
-  int res = inotify_rm_watch(fd, watchdesc);
-  if (res == 0) { result[0] = INE_NONE; }
-  else if (errno == EBADF || errno = EINVAL) { result[0] = (int)INE_BAD_ARGS; }
-  else { result[0] = (int)INE_UNDEFINED; }
-  return;
-}
-
-"""
-
-_ffi_def = """\
-// INotify Flags
-IN_ACCESS
-IN_ATTRIB
-IN_CLOSE_WRITE
-IN_CLOSE_NOWRITE
-IN_CREATE
-IN_DELETE
-IN_DELETE_SELF
-IN_MODIFY
-IN_MOVE_SELF
-IN_MOVED_FROM
-IN_MOVED_TO
-IN_OPEN
-IN_MOVED
-IN_CLOSE
-IN_DONT_FOLLOW
-IN_EXCL_UNLINK
-IN_MASK_ADD
-IN_ONESHOT
-IN_ONLYDIR
-IN_MASK_CREATE
-IN_IGNORED
-IN_ISDIR
-IN_Q_OVERFLOW
-IN_UNMOUNT
-
-// INotify Interface
+_CDEF = """\
 void c_inotify_init(int flags, int result[2]);
 void c_inotify_add_watch(int fd, const char *path, int mask, int result[2]);
 void c_inotify_rm_watch(int fd, int watchdesc, int result[1]);
 """
+LIB_BUILD_SPEC: BuildSpec = {
+  'cdef': _CDEF,
+  'include': ['linuxinotify.h'],
+  'sources': ['src/linuxinotify.c'],
+}
+_lib_path = pathlib.Path(__file__).parent
+if 'linux_inotify' not in c_registry.modules:
+  _lib_fingerprint = calculate_module_fingerprint(_lib_path, LIB_BUILD_SPEC)
+  c_registry.add_module("linux_inotify", LIB_BUILD_SPEC)
+  c_registry.build_module("linux_inotify", _lib_path, _lib_fingerprint)
 
-ffi = cffi.FFI()
-ffi_alloc = ffi.new_allocator(should_clear_after_alloc=False)
-
-### Python Interface ###
-
-import _utils_linux_inotify
-
+### Final Imports ###
+import linux_inotify
 import weakref, enum, pathlib, time, asyncio, os
 from loguru import logger
 from copy import deepcopy
@@ -148,45 +47,45 @@ class INotifyMask(enum.IntFlag):
   """A Mask of INotify Events."""
   NONE = 0
   ### inotify_add_watch(2) Flags ###
-  IN_ACCESS = _utils_linux_inotify.IN_ACCESS
-  IN_ATTRIB = _utils_linux_inotify.IN_ATTRIB
-  IN_CLOSE_WRITE = _utils_linux_inotify.IN_CLOSE_WRITE
-  IN_CLOSE_NOWRITE = _utils_linux_inotify.IN_CLOSE_NOWRITE
-  IN_CREATE = _utils_linux_inotify.IN_CREATE
-  IN_DELETE = _utils_linux_inotify.IN_DELETE
-  IN_DELETE_SELF = _utils_linux_inotify.IN_DELETE_SELF
-  IN_MODIFY = _utils_linux_inotify.IN_MODIFY
-  IN_MOVE_SELF = _utils_linux_inotify.IN_MOVE_SELF
-  IN_MOVED_FROM = _utils_linux_inotify.IN_MOVED_FROM
-  IN_MOVED_TO = _utils_linux_inotify.IN_MOVED_TO
-  IN_OPEN = _utils_linux_inotify.IN_OPEN
-  IN_MOVED = _utils_linux_inotify.IN_MOVED
-  IN_CLOSE = _utils_linux_inotify.IN_CLOSE
+  IN_ACCESS = linux_inotify.IN_ACCESS
+  IN_ATTRIB = linux_inotify.IN_ATTRIB
+  IN_CLOSE_WRITE = linux_inotify.IN_CLOSE_WRITE
+  IN_CLOSE_NOWRITE = linux_inotify.IN_CLOSE_NOWRITE
+  IN_CREATE = linux_inotify.IN_CREATE
+  IN_DELETE = linux_inotify.IN_DELETE
+  IN_DELETE_SELF = linux_inotify.IN_DELETE_SELF
+  IN_MODIFY = linux_inotify.IN_MODIFY
+  IN_MOVE_SELF = linux_inotify.IN_MOVE_SELF
+  IN_MOVED_FROM = linux_inotify.IN_MOVED_FROM
+  IN_MOVED_TO = linux_inotify.IN_MOVED_TO
+  IN_OPEN = linux_inotify.IN_OPEN
+  IN_MOVED = linux_inotify.IN_MOVED
+  IN_CLOSE = linux_inotify.IN_CLOSE
   ### inotify_add_watch(2) Flags ###
-  IN_DONT_FOLLOW = _utils_linux_inotify.IN_DONT_FOLLOW
-  IN_EXCL_UNLINK = _utils_linux_inotify.IN_EXCL_UNLINK
-  IN_MASK_ADD = _utils_linux_inotify.IN_MASK_ADD
-  IN_ONESHOT = _utils_linux_inotify.IN_ONESHOT
-  IN_ONLYDIR = _utils_linux_inotify.IN_ONLYDIR
-  IN_MASK_CREATE = _utils_linux_inotify.IN_MASK_CREATE
+  IN_DONT_FOLLOW = linux_inotify.IN_DONT_FOLLOW
+  IN_EXCL_UNLINK = linux_inotify.IN_EXCL_UNLINK
+  IN_MASK_ADD = linux_inotify.IN_MASK_ADD
+  IN_ONESHOT = linux_inotify.IN_ONESHOT
+  IN_ONLYDIR = linux_inotify.IN_ONLYDIR
+  IN_MASK_CREATE = linux_inotify.IN_MASK_CREATE
   ### extra read(2) Flags ###
-  IN_IGNORED = _utils_linux_inotify.IN_IGNORED
-  IN_ISDIR = _utils_linux_inotify.IN_ISDIR
-  IN_Q_OVERFLOW = _utils_linux_inotify.IN_Q_OVERFLOW
-  IN_UNMOUNT = _utils_linux_inotify.IN_UNMOUNT
+  IN_IGNORED = linux_inotify.IN_IGNORED
+  IN_ISDIR = linux_inotify.IN_ISDIR
+  IN_Q_OVERFLOW = linux_inotify.IN_Q_OVERFLOW
+  IN_UNMOUNT = linux_inotify.IN_UNMOUNT
 
 def inotify_init(flags: INotifyMask) -> tuple[Error | NO_ERROR_T, int | None]:
-  c_err, fd = _utils_linux_inotify.c_inotify_init(flags)
+  c_err, fd = linux_inotify.c_inotify_init(flags)
   if c_err: return { 'kind': ..., 'msg': ... }, None
   return NO_ERROR, fd
 
 def inotify_add_watch(fd: int, path: str, mask: INotifyMask) -> tuple[Error | NO_ERROR_T, int | None]:
-  c_err, watchdesc = _utils_linux_inotify.c_inotify_add_watch(fd, path, mask)
+  c_err, watchdesc = linux_inotify.c_inotify_add_watch(fd, path, mask)
   if c_err: return { 'kind': ..., 'msg': ... }, None
   return NO_ERROR, watchdesc
 
 def inotify_rm_watch(fd: int, watchdesc: int) -> Error | NO_ERROR_T:
-  c_err = _utils_linux_inotify.c_inotify_rm_watch(fd, watchdesc)
+  c_err = linux_inotify.c_inotify_rm_watch(fd, watchdesc)
   if c_err: return { 'kind': ..., 'msg': ... }
   return NO_ERROR
 
@@ -498,4 +397,3 @@ class FSMonitor:
   def snapshot(self) -> MonitorState:
     """Returns a Snapshot of the current Monitor Cache."""
     return deepcopy(self._ctx['cache']) # TODO Is there a better way to do this?
-  

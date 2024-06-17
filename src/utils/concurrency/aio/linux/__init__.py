@@ -1,17 +1,24 @@
 from __future__ import annotations
 import pathlib
 from utils.extern import active_backend, SystemBackend
-from utils.extern.c import BuildSpec, c_registry, c_malloc, c_buffer, c_from_buffer
+from utils.extern.c import calculate_module_fingerprint, BuildSpec, c_registry, c_malloc, c_buffer, c_from_buffer
 
 if active_backend != SystemBackend.LINUX: raise RuntimeError("Linux IO is only supported on Linux")
 
-_src_dir = pathlib.Path(__file__).parent
+_CDEF = """\
+void c_read_from_fd_into_buffer(int fd, char *buffer, size_t count, size_t buf_offset, int result[2]);
+void c_write_from_buffer_into_fd(int fd, char *buffer, size_t count, size_t buf_offset, int result[2]);
+"""
 LIB_BUILD_SPEC: BuildSpec = {
-  'headers': list(_src_dir.glob('*.h')),
-  'source': list(_src_dir.glob('*.c')),
+  'cdef': _CDEF,
+  'include': ['aiolinux.h'],
+  'sources': ['src/aiolinux.c'],
 }
-c_registry.add_module("aio_linux", LIB_BUILD_SPEC)
-c_registry.build_module("aio_linux")
+_lib_path = pathlib.Path(__file__).parent
+if 'aio_linux' not in c_registry.modules:
+  _lib_fingerprint = calculate_module_fingerprint(_lib_path, LIB_BUILD_SPEC)
+  c_registry.add_module("aio_linux", LIB_BUILD_SPEC)
+  c_registry.build_module("aio_linux", _lib_path, _lib_fingerprint)
 
 import aio_linux
 from .. import IOErrorReason, AIOError
