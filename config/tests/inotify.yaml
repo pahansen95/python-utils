@@ -1,0 +1,17 @@
+metadata:
+  name: tests-inotify
+  version: 0.0.1
+spec:
+  source: src/utils
+  artifact:
+    kind: tar.gz
+    dst: artifacts/utils.tar.gz
+  build:
+    include: [
+      'utils/extern', 'utils/extern/*', 'utils/extern/**/*',
+      'utils/linux', 'utils/linux/*', 'utils/linux/**/*',
+      'utils/concurrency', 'utils/concurrency/*', 'utils/concurrency/**/*',
+      'utils/errors',
+      'utils/testing',
+    ]
+    exclude: [  ]
