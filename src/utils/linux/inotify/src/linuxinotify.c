@@ -1,8 +1,7 @@
-#include <sys/inotify.h>
-#include <errno.h>
+#include <unistd.h>
 #include "linuxinotify.h"
 
-void c_inotify_init(int flags, int result[2]) {
+void c_inotify_init(const int flags, int result[2]) {
   /*
   Initialize a new INotify Instance.
   Args:
@@ -19,7 +18,7 @@ void c_inotify_init(int flags, int result[2]) {
   return;
 }
 
-void c_inotify_add_watch(int fd, const char *path, int mask, int result[2]) {
+void c_inotify_add_watch(const int fd, const char *path, const int mask, int result[2]) {
   /*
   Add a Watch to a Path.
   Args:
@@ -40,7 +39,7 @@ void c_inotify_add_watch(int fd, const char *path, int mask, int result[2]) {
   return;
 }
 
-void c_inotify_rm_watch(int fd, int watchdesc, int result[1]) {
+void c_inotify_rm_watch(const int fd, const int watchdesc, int result[1]) {
   /*
   Remove a Watch from a Path.
   Args:
@@ -53,5 +52,23 @@ void c_inotify_rm_watch(int fd, int watchdesc, int result[1]) {
   if (res == 0) { result[0] = INE_NONE; }
   else if (errno == EBADF || errno == EINVAL) { result[0] = (int)INE_BAD_ARGS; }
   else { result[0] = (int)INE_UNDEFINED; }
+  return;
+}
+
+void c_read_event(const int fd, struct inotify_event *event, int result[1]) {
+  /*
+  Read an Event from the INotify Instance.
+  Args:
+    fd: The File Descriptor of the INotify Instance.
+    result: A "tuple" of (errno, event) where event 
+  */
+  errno = 0; // Reset errno
+  // Read Length: sizeof(struct inotify_event) + NAME_MAX + 1
+  ssize_t len = read(fd, event, INOTEV_READ_SIZE);
+  if (len == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) { result[0] = INE_BLOCK; }
+    else if (errno == EBADF || errno == EFAULT || errno == EINVAL) { result[0] = (int)INE_BAD_ARGS; }
+    else { result[0] = (int)INE_UNDEFINED; }
+  } else { result[0] = INE_NONE; }
   return;
 }
