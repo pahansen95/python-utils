@@ -1,7 +1,7 @@
 from __future__ import annotations
 import pathlib
 from utils.extern import active_backend, SystemBackend
-from utils.extern.c import calculate_module_fingerprint, BuildSpec, c_registry, c_malloc, c_buffer, c_from_buffer
+from utils.extern.c import calculate_module_fingerprint, BuildSpec, c_registry
 
 if active_backend != SystemBackend.LINUX: raise RuntimeError("Linux IO is only supported on Linux")
 
@@ -17,10 +17,11 @@ LIB_BUILD_SPEC: BuildSpec = {
 _lib_path = pathlib.Path(__file__).parent
 if 'aio_linux' not in c_registry.modules:
   _lib_fingerprint = calculate_module_fingerprint(_lib_path, LIB_BUILD_SPEC)
-  c_registry.add_module("aio_linux", LIB_BUILD_SPEC)
-  c_registry.build_module("aio_linux", _lib_path, _lib_fingerprint)
+  c_registry.add("aio_linux", LIB_BUILD_SPEC)
+  build_status =  c_registry.build("aio_linux", _lib_path, _lib_fingerprint)
+  assert build_status['fingerprint'] == _lib_fingerprint
+c_lib, aio_linux = c_registry.get('aio_linux')
 
-import aio_linux
 from .. import IOErrorReason, AIOError
 
 _linux_io_errors: dict[int, IOErrorReason] = {
@@ -65,9 +66,9 @@ def fd_read(
   # So we copy the data out before returning.
   # If we don't want to copy data then a buffer needs to be provided that we can write into.
   ###
-  buffer = c_malloc("char[]", n) if into is None else c_from_buffer(into, require_writable=True)
-  result = c_malloc("int[]", 2)
-  aio_linux.lib.c_read_from_fd_into_buffer(fd, buffer, n, 0 if into is None else into_offset, result)
+  buffer = c_lib.new("char[]", n) if into is None else c_lib.from_buffer(into, require_writable=True)
+  result = c_lib.new("int[]", 2)
+  aio_linux.c_read_from_fd_into_buffer(fd, buffer, n, 0 if into is None else into_offset, result)
   ###
 
   (_errno, _bytes_read) = (result[0], result[1])
@@ -76,7 +77,7 @@ def fd_read(
   elif _bytes_read == 0: return (error_map[_errno], b'') if into is None else (error_map[_errno], 0)
   else: return (
     error_map[_errno],
-    c_buffer(buffer, _bytes_read)[:] if into is None else _bytes_read, # This is a copy of the buffer as a bytes object
+    c_lib.buffer(buffer, _bytes_read)[:] if into is None else _bytes_read, # This is a copy of the buffer as a bytes object
   )
 
 def fd_write(
@@ -116,9 +117,9 @@ def fd_write(
   # So we copy the data out before returning.
   # If we don't want to copy data then a buffer needs to be provided that we can write into.
   ###
-  _buffer = c_from_buffer(buffer, require_writable=False)
-  result = c_malloc("int[]", 2)
-  aio_linux.lib.c_write_from_buffer_into_fd(fd, _buffer, _count, buffer_offset, result)
+  _buffer = c_lib.from_buffer(buffer, require_writable=False)
+  result = c_lib.new("int[]", 2)
+  aio_linux.c_write_from_buffer_into_fd(fd, _buffer, _count, buffer_offset, result)
   ###
   (_errno, _bytes_written) = (result[0], result[1])
   assert isinstance(_errno, int) and isinstance(_bytes_written, int)
